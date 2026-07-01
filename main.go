@@ -41,7 +41,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"io"
 	"net"
 	"net/http"
@@ -59,12 +58,18 @@ import (
 
 const (
 	pluginName    = "CPA Diagnostics"
-	pluginVersion = "0.1.0"
+	pluginVersion = "0.1.3"
 	pluginAuthor  = "yuankc"
 	pluginRepo    = "https://github.com/yuankc/cliproxy-diagnostics-plugin"
 )
 
-var httpClient = &http.Client{Timeout: 5 * time.Second}
+var (
+	httpClient = &http.Client{Timeout: 5 * time.Second}
+
+	diagnosticsCacheMu      sync.Mutex
+	diagnosticsCacheData    diagnostics
+	diagnosticsCacheExpires time.Time
+)
 
 type registration struct {
 	SchemaVersion uint32             `json:"schema_version"`
@@ -82,6 +87,9 @@ type diagnostics struct {
 	LocalIPs        []localIP          `json:"local_ips"`
 	OutboundSources []outboundSource   `json:"outbound_sources"`
 	PublicIP        publicIPResult     `json:"public_ip"`
+	IPRisk          ipRiskProfile      `json:"ip_risk"`
+	OpenAI          openAIAvailability `json:"openai"`
+	Geo             geoConsistency     `json:"geo_consistency"`
 	DNS             []dnsResult        `json:"dns"`
 	Connectivity    []connectivityTest `json:"connectivity"`
 	Risk            riskSummary        `json:"risk"`
@@ -89,10 +97,12 @@ type diagnostics struct {
 }
 
 type runtimeInfo struct {
-	Hostname string `json:"hostname"`
-	GOOS     string `json:"goos"`
-	GOARCH   string `json:"goarch"`
-	PID      int    `json:"pid"`
+	Hostname     string `json:"hostname"`
+	GOOS         string `json:"goos"`
+	GOARCH       string `json:"goarch"`
+	PID          int    `json:"pid"`
+	TimezoneName string `json:"timezone_name,omitempty"`
+	TimezoneUTC  string `json:"timezone_utc,omitempty"`
 }
 
 type localIP struct {
@@ -149,8 +159,68 @@ type connectivityTest struct {
 	StatusCode   int    `json:"status_code,omitempty"`
 	LatencyMS    int64  `json:"latency_ms,omitempty"`
 	Reachable    bool   `json:"reachable"`
+	Blocked      bool   `json:"blocked"`
 	ExpectedNote string `json:"expected_note"`
 	Error        string `json:"error,omitempty"`
+}
+
+// ipRiskProfile combines multiple IP reputation sources to identify high-risk egress IP types.
+type ipRiskProfile struct {
+	IP         string        `json:"ip,omitempty"`
+	Type       string        `json:"type,omitempty"` // residential / hosting / mobile / business / unknown
+	IsDatacen  bool          `json:"is_datacenter"`
+	IsProxy    bool          `json:"is_proxy"`
+	IsVPN      bool          `json:"is_vpn"`
+	IsTor      bool          `json:"is_tor"`
+	IsAbuser   bool          `json:"is_abuser"`
+	IsMobile   bool          `json:"is_mobile"`
+	ASN        string        `json:"asn,omitempty"`
+	Org        string        `json:"org,omitempty"`
+	Source     string        `json:"source,omitempty"`
+	LatencyMS  int64         `json:"latency_ms,omitempty"`
+	Determined bool          `json:"determined"`
+	Checks     []ipRiskCheck `json:"checks"`
+}
+
+type ipRiskCheck struct {
+	Name      string `json:"name"`
+	URL       string `json:"url"`
+	Type      string `json:"type,omitempty"`
+	IsDatacen bool   `json:"is_datacenter"`
+	IsProxy   bool   `json:"is_proxy"`
+	IsVPN     bool   `json:"is_vpn"`
+	IsTor     bool   `json:"is_tor"`
+	IsAbuser  bool   `json:"is_abuser"`
+	IsMobile  bool   `json:"is_mobile"`
+	ASN       string `json:"asn,omitempty"`
+	Org       string `json:"org,omitempty"`
+	LatencyMS int64  `json:"latency_ms,omitempty"`
+	OK        bool   `json:"ok"`
+	Error     string `json:"error,omitempty"`
+}
+
+// openAIAvailability captures OpenAI/ChatGPT availability signals beyond simple connectivity.
+type openAIAvailability struct {
+	Supported          bool   `json:"supported"`
+	UnsupportedCountry bool   `json:"unsupported_country"`
+	CFCountry          string `json:"cf_country,omitempty"` // Country detected by chatgpt.com Cloudflare edge
+	CFIP               string `json:"cf_ip,omitempty"`      // Egress IP returned by Cloudflare trace
+	ComplianceOK       bool   `json:"compliance_ok"`        // Whether the compliance endpoint returned successfully
+	ComplianceBody     string `json:"compliance_body,omitempty"`
+	LatencyMS          int64  `json:"latency_ms,omitempty"`
+	Determined         bool   `json:"determined"`
+	Note               string `json:"note"`
+	Error              string `json:"error,omitempty"`
+}
+
+// geoConsistency compares public IP and Cloudflare country signals; timezone is supplemental context.
+type geoConsistency struct {
+	IPCountry    string   `json:"ip_country,omitempty"`
+	CFCountry    string   `json:"cf_country,omitempty"`
+	TimezoneName string   `json:"timezone_name,omitempty"`
+	TimezoneUTC  string   `json:"timezone_utc,omitempty"`
+	Consistent   bool     `json:"consistent"`
+	Signals      []string `json:"signals"`
 }
 
 type riskSummary struct {
@@ -269,7 +339,7 @@ func handleManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRespo
 }
 
 func diagnosticsJSONResponse() pluginapi.ManagementResponse {
-	body, errMarshal := json.MarshalIndent(collectDiagnostics(), "", "  ")
+	body, errMarshal := json.MarshalIndent(cachedDiagnostics(), "", "  ")
 	if errMarshal != nil {
 		return textResponse(http.StatusInternalServerError, errMarshal.Error())
 	}
@@ -283,15 +353,36 @@ func diagnosticsJSONResponse() pluginapi.ManagementResponse {
 	}
 }
 
+func cachedDiagnostics() diagnostics {
+	now := time.Now()
+	diagnosticsCacheMu.Lock()
+	if !diagnosticsCacheExpires.IsZero() && now.Before(diagnosticsCacheExpires) {
+		cached := diagnosticsCacheData
+		diagnosticsCacheMu.Unlock()
+		return cached
+	}
+	diagnosticsCacheMu.Unlock()
+
+	data := collectDiagnostics()
+	diagnosticsCacheMu.Lock()
+	diagnosticsCacheData = data
+	diagnosticsCacheExpires = time.Now().Add(30 * time.Second)
+	diagnosticsCacheMu.Unlock()
+	return data
+}
+
 func collectDiagnostics() diagnostics {
 	started := time.Now()
 	hostname, _ := os.Hostname()
+	tzName, tzUTC := localTimezone()
 
 	localIPs := collectLocalIPs()
 	publicIP, dnsResults, connectivity, outbound := publicIPResult{}, []dnsResult{}, []connectivityTest{}, []outboundSource{}
+	openAI := openAIAvailability{}
 
+	// Run independent probes concurrently.
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(5)
 	go func() {
 		defer wg.Done()
 		publicIP = detectPublicIP()
@@ -308,25 +399,54 @@ func collectDiagnostics() diagnostics {
 		defer wg.Done()
 		outbound = detectOutboundSources([]string{"api.openai.com:443", "chatgpt.com:443", "1.1.1.1:443"})
 	}()
+	go func() {
+		defer wg.Done()
+		openAI = detectOpenAIAvailability()
+	}()
 	wg.Wait()
+
+	// Run probes that depend on the detected public IP.
+	ipRisk := ipRiskProfile{}
+	if publicIP.IP != "" {
+		ipRisk = detectIPRisk(publicIP.IP)
+	}
+	geo := evaluateGeoConsistency(publicIP, openAI, tzName, tzUTC)
 
 	out := diagnostics{
 		CheckedAt: time.Now().Format(time.RFC3339),
 		Runtime: runtimeInfo{
-			Hostname: hostname,
-			GOOS:     runtime.GOOS,
-			GOARCH:   runtime.GOARCH,
-			PID:      os.Getpid(),
+			Hostname:     hostname,
+			GOOS:         runtime.GOOS,
+			GOARCH:       runtime.GOARCH,
+			PID:          os.Getpid(),
+			TimezoneName: tzName,
+			TimezoneUTC:  tzUTC,
 		},
 		LocalIPs:        localIPs,
 		OutboundSources: outbound,
 		PublicIP:        publicIP,
+		IPRisk:          ipRisk,
+		OpenAI:          openAI,
+		Geo:             geo,
 		DNS:             dnsResults,
 		Connectivity:    connectivity,
 		DurationMS:      time.Since(started).Milliseconds(),
 	}
 	out.Risk = summarizeRisk(out)
 	return out
+}
+
+func localTimezone() (name string, utc string) {
+	now := time.Now()
+	zone, offset := now.Zone()
+	sign := "+"
+	if offset < 0 {
+		sign = "-"
+		offset = -offset
+	}
+	hours := offset / 3600
+	minutes := (offset % 3600) / 60
+	return zone, fmt.Sprintf("UTC%s%02d:%02d", sign, hours, minutes)
 }
 
 func collectLocalIPs() []localIP {
@@ -385,25 +505,34 @@ func ipFromAddr(addr net.Addr) net.IP {
 }
 
 func detectOutboundSources(targets []string) []outboundSource {
-	out := make([]outboundSource, 0, len(targets))
-	for _, target := range targets {
-		started := time.Now()
-		conn, errDial := net.DialTimeout("tcp", target, 4*time.Second)
-		item := outboundSource{Target: target, Latency: time.Since(started).Milliseconds(), OK: errDial == nil}
-		if errDial != nil {
-			item.Error = compactError(errDial)
-			out = append(out, item)
-			continue
-		}
-		if tcp, ok := conn.LocalAddr().(*net.TCPAddr); ok && tcp.IP != nil {
-			item.LocalIP = tcp.IP.String()
-		}
-		if errClose := conn.Close(); errClose != nil && item.Error == "" {
-			item.Error = compactError(errClose)
-		}
-		out = append(out, item)
+	out := make([]outboundSource, len(targets))
+	var wg sync.WaitGroup
+	for index, target := range targets {
+		wg.Add(1)
+		go func(index int, target string) {
+			defer wg.Done()
+			out[index] = probeOutboundSource(target)
+		}(index, target)
 	}
+	wg.Wait()
 	return out
+}
+
+func probeOutboundSource(target string) outboundSource {
+	started := time.Now()
+	conn, errDial := net.DialTimeout("tcp", target, 4*time.Second)
+	item := outboundSource{Target: target, Latency: time.Since(started).Milliseconds(), OK: errDial == nil}
+	if errDial != nil {
+		item.Error = compactError(errDial)
+		return item
+	}
+	if tcp, ok := conn.LocalAddr().(*net.TCPAddr); ok && tcp.IP != nil {
+		item.LocalIP = tcp.IP.String()
+	}
+	if errClose := conn.Close(); errClose != nil && item.Error == "" {
+		item.Error = compactError(errClose)
+	}
+	return item
 }
 
 func detectPublicIP() publicIPResult {
@@ -550,21 +679,27 @@ func nestedString(payload map[string]any, path ...string) string {
 
 func checkDNS(hosts []string) []dnsResult {
 	resolver := net.DefaultResolver
-	results := make([]dnsResult, 0, len(hosts))
-	for _, host := range hosts {
-		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-		started := time.Now()
-		addrs, errLookup := resolver.LookupHost(ctx, host)
-		cancel()
-		item := dnsResult{Host: host, LatencyMS: time.Since(started).Milliseconds(), OK: errLookup == nil}
-		if errLookup != nil {
-			item.Error = compactError(errLookup)
-		} else {
-			sort.Strings(addrs)
-			item.Addresses = addrs
-		}
-		results = append(results, item)
+	results := make([]dnsResult, len(hosts))
+	var wg sync.WaitGroup
+	for index, host := range hosts {
+		wg.Add(1)
+		go func(index int, host string) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			started := time.Now()
+			addrs, errLookup := resolver.LookupHost(ctx, host)
+			cancel()
+			item := dnsResult{Host: host, LatencyMS: time.Since(started).Milliseconds(), OK: errLookup == nil}
+			if errLookup != nil {
+				item.Error = compactError(errLookup)
+			} else {
+				sort.Strings(addrs)
+				item.Addresses = addrs
+			}
+			results[index] = item
+		}(index, host)
 	}
+	wg.Wait()
 	return results
 }
 
@@ -574,15 +709,21 @@ func checkConnectivity() []connectivityTest {
 		url  string
 		note string
 	}{
-		{name: "ChatGPT Web", url: "https://chatgpt.com/", note: "2xx/3xx/401/403 都说明网络已到达站点。"},
+		{name: "ChatGPT Web", url: "https://chatgpt.com/", note: "2xx/3xx/401 说明网络已到达站点；403 + 拦截页说明该 IP 被 Cloudflare 拒绝。"},
 		{name: "OpenAI API", url: "https://api.openai.com/v1/models", note: "未带 API key 时 401 是正常可达。"},
 		{name: "OpenAI Auth", url: "https://auth.openai.com/", note: "登录域名可达性。"},
 		{name: "OpenAI CDN", url: "https://cdn.openai.com/", note: "静态资源域名可达性。"},
 	}
-	results := make([]connectivityTest, 0, len(targets))
-	for _, target := range targets {
-		results = append(results, probeHTTP(target.name, target.url, target.note))
+	results := make([]connectivityTest, len(targets))
+	var wg sync.WaitGroup
+	for index, target := range targets {
+		wg.Add(1)
+		go func(index int, name, url, note string) {
+			defer wg.Done()
+			results[index] = probeHTTP(name, url, note)
+		}(index, target.name, target.url, target.note)
 	}
+	wg.Wait()
 	return results
 }
 
@@ -602,32 +743,437 @@ func probeHTTP(name, url, note string) connectivityTest {
 		return item
 	}
 	defer closeBody(resp.Body)
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
 	item.StatusCode = resp.StatusCode
+	// Reaching the site is not the same as the service being usable.
 	item.Reachable = resp.StatusCode > 0 && resp.StatusCode < 500
+	// Detect Cloudflare/OpenAI block pages for datacenter or restricted IPs.
+	item.Blocked = isBlockedResponse(resp.StatusCode, body)
 	return item
+}
+
+// isBlockedResponse reports whether the response looks like an IP block page.
+func isBlockedResponse(status int, body []byte) bool {
+	if body != nil && bodyHasBlockMarker(body) {
+		return true
+	}
+	// Treat 403/451 as blocked when no stronger signal is available.
+	if status == http.StatusForbidden || status == http.StatusUnavailableForLegalReasons {
+		return true
+	}
+	return false
+}
+
+// bodyHasBlockMarker checks Cloudflare/OpenAI block-page markers.
+func bodyHasBlockMarker(body []byte) bool {
+	text := strings.ToLower(string(body))
+	needles := []string{
+		"you have been blocked",
+		"sorry, you have been blocked",
+		"cf-error-details",
+		"attention required",
+		"access denied",
+		"unsupported_country",
+	}
+	for _, needle := range needles {
+		if strings.Contains(text, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// detectIPRisk profiles the public IP with multiple reputation sources.
+func detectIPRisk(ip string) ipRiskProfile {
+	endpoints := []struct {
+		name string
+		url  string
+	}{
+		{name: "ipapi.is", url: "https://api.ipapi.is/?q=" + ip},
+		{name: "ip-api.com", url: "http://ip-api.com/json/" + ip + "?fields=status,message,proxy,hosting,mobile,as,org,isp,countryCode"},
+	}
+	checks := make([]ipRiskCheck, len(endpoints))
+	var wg sync.WaitGroup
+	for index, endpoint := range endpoints {
+		wg.Add(1)
+		go func(index int, name, url string) {
+			defer wg.Done()
+			checks[index] = fetchIPRisk(name, url)
+		}(index, endpoint.name, endpoint.url)
+	}
+	wg.Wait()
+
+	profile := ipRiskProfile{IP: ip, Type: "unknown", Checks: checks}
+	for _, check := range checks {
+		if !check.OK {
+			continue
+		}
+		profile.Determined = true
+		// Merge boolean risk signals conservatively.
+		profile.IsDatacen = profile.IsDatacen || check.IsDatacen
+		profile.IsProxy = profile.IsProxy || check.IsProxy
+		profile.IsVPN = profile.IsVPN || check.IsVPN
+		profile.IsTor = profile.IsTor || check.IsTor
+		profile.IsAbuser = profile.IsAbuser || check.IsAbuser
+		profile.IsMobile = profile.IsMobile || check.IsMobile
+		if profile.ASN == "" && check.ASN != "" {
+			profile.ASN = check.ASN
+		}
+		if profile.Org == "" && check.Org != "" {
+			profile.Org = check.Org
+		}
+		if profile.Source == "" {
+			profile.Source = check.Name
+			profile.LatencyMS = check.LatencyMS
+		}
+		if check.Type != "" && profile.Type == "unknown" {
+			profile.Type = check.Type
+		}
+	}
+	// Prefer explicit datacenter/mobile signals over residential defaults.
+	switch {
+	case profile.IsDatacen:
+		profile.Type = "hosting"
+	case profile.IsMobile:
+		profile.Type = "mobile"
+	case profile.Determined && profile.Type == "unknown":
+		profile.Type = "residential"
+	}
+	return profile
+}
+
+func fetchIPRisk(name, url string) ipRiskCheck {
+	check := ipRiskCheck{Name: name, URL: url}
+	body, status, latency, err := httpGetJSON(url)
+	check.LatencyMS = latency
+	if err != nil {
+		check.Error = publicIPErrorMessage(err)
+		return check
+	}
+	if status < 200 || status >= 300 {
+		check.Error = fmt.Sprintf("HTTP %d", status)
+		return check
+	}
+	var payload map[string]any
+	if errJSON := json.Unmarshal(body, &payload); errJSON != nil {
+		check.Error = "响应不是有效 JSON"
+		return check
+	}
+	switch name {
+	case "ipapi.is":
+		parseIPAPIIs(payload, &check)
+	case "ip-api.com":
+		if firstString(payload, "status") == "fail" {
+			check.Error = valueOr(firstString(payload, "message"), "查询失败")
+			return check
+		}
+		parseIPAPICom(payload, &check)
+	}
+	check.OK = true
+	return check
+}
+
+// parseIPAPIIs parses ipapi.is reputation fields.
+func parseIPAPIIs(payload map[string]any, check *ipRiskCheck) {
+	check.IsDatacen = boolField(payload, "is_datacenter")
+	check.IsProxy = boolField(payload, "is_proxy")
+	check.IsVPN = boolField(payload, "is_vpn")
+	check.IsTor = boolField(payload, "is_tor")
+	check.IsAbuser = boolField(payload, "is_abuser")
+	check.IsMobile = boolField(payload, "is_mobile")
+	if asn, ok := payload["asn"].(map[string]any); ok {
+		check.ASN = firstString(asn, "asn", "org")
+		if org, okOrg := asn["org"].(string); okOrg {
+			check.Org = strings.TrimSpace(org)
+		}
+		if t, okType := asn["type"].(string); okType {
+			check.Type = normalizeIPType(t)
+		}
+	}
+	if company, ok := payload["company"].(map[string]any); ok {
+		if check.Org == "" {
+			check.Org = firstString(company, "name")
+		}
+		if check.Type == "" {
+			if t, okType := company["type"].(string); okType {
+				check.Type = normalizeIPType(t)
+			}
+		}
+	}
+}
+
+// parseIPAPICom parses ip-api.com fields.
+func parseIPAPICom(payload map[string]any, check *ipRiskCheck) {
+	check.IsProxy = boolField(payload, "proxy")
+	check.IsDatacen = boolField(payload, "hosting")
+	check.IsMobile = boolField(payload, "mobile")
+	check.ASN = firstString(payload, "as")
+	check.Org = firstString(payload, "org", "isp")
+	if check.IsDatacen {
+		check.Type = "hosting"
+	} else if check.IsMobile {
+		check.Type = "mobile"
+	}
+}
+
+// normalizeIPType maps provider-specific IP type labels.
+func normalizeIPType(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "hosting", "datacenter", "data center":
+		return "hosting"
+	case "isp", "residential":
+		return "residential"
+	case "business":
+		return "business"
+	case "mobile", "cellular":
+		return "mobile"
+	default:
+		return "unknown"
+	}
+}
+
+// detectOpenAIAvailability checks OpenAI-side availability signals, not just connectivity.
+func detectOpenAIAvailability() openAIAvailability {
+	result := openAIAvailability{}
+	started := time.Now()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	var complianceBody []byte
+	var complianceStatus int
+	var complianceErr error
+	go func() {
+		defer wg.Done()
+		complianceBody, complianceStatus, _, complianceErr = httpGetJSON("https://api.openai.com/compliance/cookie_requirements")
+	}()
+
+	var traceText string
+	var traceErr error
+	go func() {
+		defer wg.Done()
+		traceText, traceErr = fetchCFTrace("https://chatgpt.com/cdn-cgi/trace")
+	}()
+	wg.Wait()
+	result.LatencyMS = time.Since(started).Milliseconds()
+
+	// Parse Cloudflare trace.
+	if traceErr == nil && traceText != "" {
+		fields := parseCFTrace(traceText)
+		if fields["loc"] != "" || fields["ip"] != "" {
+			result.CFCountry = fields["loc"]
+			result.CFIP = fields["ip"]
+		}
+	}
+
+	// Parse the compliance endpoint response.
+	if complianceErr != nil {
+		result.Error = publicIPErrorMessage(complianceErr)
+	} else {
+		sample := strings.ToLower(string(complianceBody))
+		result.ComplianceBody = strings.TrimSpace(truncate(string(complianceBody), 300))
+		if complianceStatus >= 200 && complianceStatus < 300 {
+			result.ComplianceOK = true
+			result.Determined = true
+			if strings.Contains(sample, "unsupported_country") {
+				result.UnsupportedCountry = true
+				result.Supported = false
+				result.Note = "OpenAI compliance 接口返回 unsupported_country，当前出口 IP 所在国家/地区不被支持。"
+			} else {
+				result.Supported = true
+				result.Note = "OpenAI compliance 接口成功返回且未出现 unsupported_country，当前出口 IP 所在地区大概率可用。"
+			}
+		} else {
+			result.Error = fmt.Sprintf("OpenAI compliance HTTP %d", complianceStatus)
+		}
+	}
+	if result.Note == "" {
+		if result.CFCountry != "" {
+			result.Determined = true
+			result.Note = "compliance 接口未确认，依据 Cloudflare 识别国家 " + result.CFCountry + " 判断。"
+		} else {
+			result.Note = "无法确认 OpenAI 可用性，接口不可达。"
+		}
+	}
+	return result
+}
+
+func fetchCFTrace(url string) (string, error) {
+	req, errReq := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	if errReq != nil {
+		return "", errReq
+	}
+	req.Header.Set("user-agent", "cliproxy-diagnostics-plugin/"+pluginVersion)
+	resp, errDo := httpClient.Do(req)
+	if errDo != nil {
+		return "", errDo
+	}
+	defer closeBody(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return "", fmt.Errorf("cloudflare trace HTTP %d", resp.StatusCode)
+	}
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if errRead != nil {
+		return "", errRead
+	}
+	return string(body), nil
+}
+
+// parseCFTrace parses the key=value cdn-cgi/trace format.
+func parseCFTrace(text string) map[string]string {
+	fields := make(map[string]string)
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			fields[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+		}
+	}
+	return fields
+}
+
+// evaluateGeoConsistency compares public IP and Cloudflare country signals.
+func evaluateGeoConsistency(pub publicIPResult, openAI openAIAvailability, tzName, tzUTC string) geoConsistency {
+	geo := geoConsistency{
+		IPCountry:    pub.Country,
+		CFCountry:    openAI.CFCountry,
+		TimezoneName: tzName,
+		TimezoneUTC:  tzUTC,
+		Consistent:   true,
+		Signals:      make([]string, 0),
+	}
+	ipCountry := strings.ToUpper(strings.TrimSpace(pub.Country))
+	cfCountry := strings.ToUpper(strings.TrimSpace(openAI.CFCountry))
+	if ipCountry != "" && cfCountry != "" && ipCountry != cfCountry {
+		geo.Consistent = false
+		geo.Signals = append(geo.Signals, "出口 IP 国家("+ipCountry+")与 Cloudflare 识别国家("+cfCountry+")不一致")
+	}
+	if len(geo.Signals) == 0 {
+		geo.Signals = append(geo.Signals, "出口 IP 国家、Cloudflare 识别国家一致；进程时区仅作参考")
+	}
+	return geo
+}
+
+// httpGetJSON performs a GET request and returns body, status, and latency.
+func httpGetJSON(url string) (body []byte, status int, latencyMS int64, err error) {
+	req, errReq := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	if errReq != nil {
+		return nil, 0, 0, errReq
+	}
+	req.Header.Set("accept", "application/json,text/plain;q=0.8")
+	req.Header.Set("user-agent", "cliproxy-diagnostics-plugin/"+pluginVersion)
+
+	var resp *http.Response
+	var errDo error
+	started := time.Now()
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			req = req.Clone(context.Background())
+			started = time.Now()
+		}
+		resp, errDo = httpClient.Do(req)
+		latencyMS = time.Since(started).Milliseconds()
+		if errDo == nil || !retryablePublicIPError(errDo) {
+			break
+		}
+	}
+	if errDo != nil {
+		return nil, 0, latencyMS, errDo
+	}
+	defer closeBody(resp.Body)
+	data, errRead := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if errRead != nil {
+		return nil, resp.StatusCode, latencyMS, errRead
+	}
+	return data, resp.StatusCode, latencyMS, nil
+}
+
+func boolField(payload map[string]any, key string) bool {
+	value, ok := payload[key]
+	if !ok {
+		return false
+	}
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(v, "true")
+	case float64:
+		return v != 0
+	default:
+		return false
+	}
+}
+
+func truncate(text string, max int) string {
+	if len(text) <= max {
+		return text
+	}
+	return text[:max] + "..."
 }
 
 func summarizeRisk(data diagnostics) riskSummary {
 	signals := make([]string, 0)
 	level := "low"
-	label := "基础检测正常"
+
 	if data.PublicIP.IP == "" {
-		level = "unknown"
-		label = "无法确认出口 IP"
-		signals = append(signals, "所有公共 IP 查询接口均失败")
+		level = maxRisk(level, "unknown")
+		signals = append(signals, "所有公共 IP 查询接口均失败，无法确认出口 IP")
 	}
-	seen := make(map[string]struct{})
-	for _, check := range data.PublicIP.Checks {
-		if check.IP != "" {
-			seen[check.IP] = struct{}{}
+
+	// Compare egress IPs by address family to avoid dual-stack false positives.
+	v4, v6 := distinctIPsByFamily(data.PublicIP.Checks)
+	if len(v4) > 1 {
+		level = maxRisk(level, "warning")
+		signals = append(signals, "多个服务返回了不同的 IPv4 出口地址（"+strings.Join(v4, ", ")+"），可能存在代理链、NAT 或接口异常")
+	}
+	if len(v6) > 1 {
+		level = maxRisk(level, "warning")
+		signals = append(signals, "多个服务返回了不同的 IPv6 出口地址，可能存在多出口或代理异常")
+	}
+
+	// IP reputation signals are high-value indicators for AI service blocks.
+	if data.IPRisk.Determined {
+		if data.IPRisk.IsTor {
+			level = maxRisk(level, "high")
+			signals = append(signals, "出口 IP 被识别为 Tor 出口节点，几乎必然被 AI 服务拦截")
+		}
+		if data.IPRisk.IsProxy {
+			level = maxRisk(level, "high")
+			signals = append(signals, "出口 IP 被标记为公共代理，属于高风险类型")
+		}
+		if data.IPRisk.IsAbuser {
+			level = maxRisk(level, "high")
+			signals = append(signals, "出口 IP 有滥用/攻击历史记录，风控评分高")
+		}
+		if data.IPRisk.IsVPN {
+			level = maxRisk(level, "warning")
+			signals = append(signals, "出口 IP 被识别为 VPN，部分 AI 服务会限制此类访问")
+		}
+		if data.IPRisk.IsDatacen && !data.IPRisk.IsVPN && !data.IPRisk.IsProxy {
+			level = maxRisk(level, "warning")
+			signals = append(signals, "出口 IP 属于机房/IDC 地址（"+valueOr(data.IPRisk.Org, data.IPRisk.ASN)+"），比住宅 IP 更容易触发 AI 风控")
 		}
 	}
-	if len(seen) > 1 {
-		level = "warning"
-		label = "出口 IP 结果不一致"
-		signals = append(signals, "多个公共 IP 服务返回不同地址，可能存在代理链、NAT 或接口异常")
+
+	// OpenAI availability is different from raw connectivity.
+	if data.OpenAI.Determined {
+		if data.OpenAI.UnsupportedCountry {
+			level = maxRisk(level, "high")
+			signals = append(signals, "OpenAI 判定当前出口 IP 所在国家/地区不受支持（unsupported_country），无法正常使用")
+		}
 	}
+
+	// Geography consistency.
+	if !data.Geo.Consistent {
+		level = maxRisk(level, "warning")
+		signals = append(signals, data.Geo.Signals...)
+	}
+
 	for _, item := range data.DNS {
 		if !item.OK {
 			level = maxRisk(level, "warning")
@@ -635,24 +1181,68 @@ func summarizeRisk(data diagnostics) riskSummary {
 		}
 	}
 	for _, item := range data.Connectivity {
-		if !item.Reachable {
+		if item.Blocked {
+			level = maxRisk(level, "high")
+			signals = append(signals, "目标站点返回 IP 拦截页: "+item.Name)
+		} else if !item.Reachable {
 			level = maxRisk(level, "warning")
 			signals = append(signals, "OpenAI 相关连通性失败: "+item.Name)
 		}
 	}
+
 	if len(signals) == 0 {
-		signals = append(signals, "公共 IP、DNS、OpenAI 相关域名均有响应")
+		signals = append(signals, "出口 IP、IP 画像、OpenAI 可用性、DNS、连通性均正常")
 	}
 	return riskSummary{
 		Level:   level,
-		Label:   label,
+		Label:   riskLabel(level),
 		Signals: signals,
-		Note:    "这是基础网络可达性与出口一致性检测，不等同于专业 IP 风控评分。",
+		Note:    "风险画像来自第三方 IP 风控接口与 OpenAI 侧信号，结果依赖接口可用性，供参考不构成绝对结论。",
+	}
+}
+
+// distinctIPsByFamily deduplicates detected egress IPs by address family.
+func distinctIPsByFamily(checks []publicIPEndpoint) (v4 []string, v6 []string) {
+	seen4 := make(map[string]struct{})
+	seen6 := make(map[string]struct{})
+	for _, check := range checks {
+		if check.IP == "" {
+			continue
+		}
+		parsed := net.ParseIP(check.IP)
+		if parsed == nil {
+			continue
+		}
+		if parsed.To4() != nil {
+			if _, ok := seen4[check.IP]; !ok {
+				seen4[check.IP] = struct{}{}
+				v4 = append(v4, check.IP)
+			}
+			continue
+		}
+		if _, ok := seen6[check.IP]; !ok {
+			seen6[check.IP] = struct{}{}
+			v6 = append(v6, check.IP)
+		}
+	}
+	return v4, v6
+}
+
+func riskLabel(level string) string {
+	switch level {
+	case "high":
+		return "存在高风险信号"
+	case "warning":
+		return "存在需关注的信号"
+	case "unknown":
+		return "部分检测无法确认"
+	default:
+		return "未发现明显风险"
 	}
 }
 
 func maxRisk(current, next string) string {
-	order := map[string]int{"low": 1, "unknown": 2, "warning": 3}
+	order := map[string]int{"low": 1, "unknown": 2, "warning": 3, "high": 4}
 	if order[next] > order[current] {
 		return next
 	}
@@ -726,19 +1316,24 @@ async function runDiagnostics(){
 function render(data){
   const pub = data.public_ip || {};
   const risk = data.risk || {};
+  const ipRisk = data.ip_risk || {};
+  const openai = data.openai || {};
   return '<section class="summary">' +
     '<div class="summaryGrid">' +
       metric('公共出口 IP', pub.ip || '未获取', 'ip mono') +
       metric('国家/地区', pub.country || '未知', 'value') +
-      metric('地区', pub.region || '未知', 'value') +
-      metric('城市', pub.city || '未知', 'value') +
-      metric('运营商/组织', pub.org || '未知', 'value') +
+      metric('IP 类型', ipTypeBadge(ipRisk), 'value raw') +
+      metric('OpenAI 可用性', openaiBadge(openai), 'value raw') +
+      metric('运营商/组织', pub.org || ipRisk.org || '未知', 'value') +
       metric('风险概览', badge(risk.level, risk.label || '未知'), 'value raw') +
     '</div>' +
     '<div class="small">检测时间：' + esc(data.checked_at || '-') + '，耗时 ' + esc(data.duration_ms || 0) + ' ms，来源：' + esc(pub.source || '无') + '。</div>' +
   '</section>' +
   '<section class="grid">' +
     panel('风险信号', renderRisk(risk)) +
+    panel('IP 风险画像', renderIPRisk(ipRisk)) +
+    panel('OpenAI 可用性', renderOpenAI(openai)) +
+    panel('地区一致性', renderGeo(data.geo_consistency || {})) +
     panel('运行环境', renderRuntime(data.runtime || {})) +
     panel('本机 IP', renderLocalIPs(data.local_ips || [])) +
     panel('出口源地址', renderOutbound(data.outbound_sources || [])) +
@@ -771,6 +1366,7 @@ function renderRuntime(info){
   return rows([
     row('Hostname', info.hostname || '-', ''),
     row('OS / Arch', compact([info.goos, info.goarch], ' / ') || '-', ''),
+    row('时区', compact([info.timezone_name, info.timezone_utc], ' ') || '-', ''),
     row('PID', String(info.pid || '-'), '')
   ]);
 }
@@ -812,8 +1408,62 @@ function renderDNS(items){
 function renderConnectivity(items){
   return rows(items.map(function(item){
     const meta = item.status_code ? ('HTTP ' + item.status_code + ' | ' + (item.expected_note || '')) : (item.error || '-');
-    return row(item.name || '-', meta, status(item.reachable, item.latency_ms));
+    const right = item.blocked ? '<span class="status bad">被拦截' + (item.latency_ms || item.latency_ms === 0 ? ' · ' + esc(item.latency_ms) + ' ms' : '') + '</span>' : status(item.reachable, item.latency_ms);
+    return row(item.name || '-', meta, right);
   }));
+}
+function renderIPRisk(ip){
+  if (!ip.determined) return '<div class="meta">未能确定 IP 画像（风控接口不可达或未获取到出口 IP）。</div>';
+  const flags = [];
+  if (ip.is_datacenter) flags.push('机房/IDC');
+  if (ip.is_proxy) flags.push('代理');
+  if (ip.is_vpn) flags.push('VPN');
+  if (ip.is_tor) flags.push('Tor');
+  if (ip.is_abuser) flags.push('滥用历史');
+  if (ip.is_mobile) flags.push('移动网络');
+  return rows([
+    row('IP 类型', ipTypeLabel(ip.type), ipTypeBadge(ip)),
+    row('风险标记', flags.length ? flags.join('、') : '无代理/VPN/机房标记', flags.length ? '<span class="status bad">命中</span>' : '<span class="status ok">干净</span>'),
+    row('ASN', ip.asn || '-', ''),
+    row('组织', ip.org || '-', ''),
+    row('数据来源', ip.source || '-', '')
+  ]);
+}
+function renderOpenAI(o){
+  if (!o.determined) return '<div class="meta">未能确定 OpenAI 可用性（compliance 接口与 Cloudflare trace 均不可达）。</div><div class="small">' + esc(o.note || '') + '</div>';
+  const supported = o.supported && !o.unsupported_country;
+  return rows([
+    row('可用性结论', supported ? '当前出口 IP 可用' : '当前出口 IP 不可用/受限', supported ? '<span class="status ok">可用</span>' : '<span class="status bad">不可用</span>'),
+    row('unsupported_country', o.unsupported_country ? '命中（该地区不被支持）' : '未命中', o.unsupported_country ? '<span class="status bad">命中</span>' : '<span class="status ok">正常</span>'),
+    row('CF 识别国家', o.cf_country || '-', ''),
+    row('compliance 接口', o.compliance_ok ? '成功返回' : (o.error || '未响应'), status(o.compliance_ok, o.latency_ms))
+  ]) + '<div class="small">' + esc(o.note || '') + '</div>';
+}
+function renderGeo(g){
+  const signals = g.signals || [];
+  return rows([
+    row('IP 国家', g.ip_country || '-', ''),
+    row('CF 识别国家', g.cf_country || '-', ''),
+    row('进程时区', compact([g.timezone_name, g.timezone_utc], ' ') || '-', g.consistent ? '<span class="status ok">一致</span>' : '<span class="status bad">不一致</span>')
+  ]) + '<div class="rows" style="margin-top:8px">' + signals.map(function(s){ return row('信号', s, ''); }).join('') + '</div>' +
+    '<div class="small">进程时区用于辅助判断部署环境，当前版本不把时区直接计入一致性结论。</div>';
+}
+function ipTypeLabel(t){
+  const map = {hosting:'机房 / 数据中心', residential:'住宅宽带', mobile:'移动网络', business:'商业宽带', unknown:'未知'};
+  return map[t] || '未知';
+}
+function ipTypeBadge(ip){
+  if (!ip || !ip.determined) return '<span class="badge badgeInfo">未知</span>';
+  const t = ip.type;
+  let cls = 'badgeInfo';
+  if (t === 'residential' || t === 'mobile' || t === 'business') cls = 'badgeOk';
+  if (t === 'hosting') cls = 'badgeBad';
+  return '<span class="badge ' + cls + '">' + esc(ipTypeLabel(t)) + '</span>';
+}
+function openaiBadge(o){
+  if (!o || !o.determined) return '<span class="badge badgeInfo">未知</span>';
+  const supported = o.supported && !o.unsupported_country;
+  return '<span class="badge ' + (supported ? 'badgeOk' : 'badgeBad') + '">' + (supported ? '可用' : '不可用') + '</span>';
 }
 function renderBrowserInfo(){
   const browser = document.getElementById('browser');
@@ -839,7 +1489,7 @@ function badge(level, label){
   let cls = 'badgeInfo';
   if (level === 'low') cls = 'badgeOk';
   if (level === 'warning') cls = 'badgeWarn';
-  if (level === 'unknown') cls = 'badgeBad';
+  if (level === 'high' || level === 'unknown') cls = 'badgeBad';
   return '<span class="badge ' + cls + '">' + esc(label || level || '未知') + '</span>';
 }
 function chips(values){
@@ -856,138 +1506,6 @@ function esc(value){
 </script>
 </body>
 </html>`
-}
-
-func renderRisk(risk riskSummary) string {
-	className := "ok"
-	if risk.Level == "warning" {
-		className = "warn"
-	} else if risk.Level == "unknown" {
-		className = "bad"
-	}
-	rows := `<div class="value ` + className + `">` + html.EscapeString(risk.Label) + `</div><div class="rows" style="margin-top:12px">`
-	for _, signal := range risk.Signals {
-		rows += `<div class="row"><div class="name">信号</div><div class="meta">` + html.EscapeString(signal) + `</div><div></div></div>`
-	}
-	rows += `</div><div class="small">` + html.EscapeString(risk.Note) + `</div>`
-	return rows
-}
-
-func renderRuntime(info runtimeInfo) string {
-	return `<div class="rows">` +
-		rowHTML("Hostname", info.Hostname, "") +
-		rowHTML("OS / Arch", info.GOOS+" / "+info.GOARCH, "") +
-		rowHTML("PID", fmt.Sprint(info.PID), "") +
-		`</div>`
-}
-
-func renderLocalIPs(items []localIP) string {
-	if len(items) == 0 {
-		return emptyHTML("没有读取到网卡地址")
-	}
-	out := `<div class="rows">`
-	for _, item := range items {
-		badges := []string{item.Version}
-		if item.Private {
-			badges = append(badges, "private")
-		}
-		if item.Loopback {
-			badges = append(badges, "loopback")
-		}
-		out += rowHTML(item.Interface, item.Address, chipsHTML(badges))
-	}
-	return out + `</div>`
-}
-
-func renderOutbound(items []outboundSource) string {
-	if len(items) == 0 {
-		return emptyHTML("没有出口源地址检测结果")
-	}
-	out := `<div class="rows">`
-	for _, item := range items {
-		status := statusHTML(item.OK, fmt.Sprint(item.Latency)+" ms")
-		value := valueOr(item.LocalIP, item.Error)
-		out += rowHTML(item.Target, value, status)
-	}
-	return out + `</div>`
-}
-
-func renderPublicChecks(items []publicIPEndpoint) string {
-	out := `<div class="rows">`
-	for _, item := range items {
-		meta := valueOr(item.IP, item.Error)
-		if item.Country != "" || item.Org != "" {
-			meta += " | " + strings.Join(nonEmpty(item.Country, item.Region, item.City, item.Org), " / ")
-		}
-		out += rowHTML(item.Name, meta, statusHTML(item.OK, fmt.Sprint(item.LatencyMS)+" ms"))
-	}
-	return out + `</div>`
-}
-
-func renderDNS(items []dnsResult) string {
-	out := `<div class="rows">`
-	for _, item := range items {
-		meta := item.Error
-		if len(item.Addresses) > 0 {
-			meta = strings.Join(item.Addresses, ", ")
-		}
-		out += rowHTML(item.Host, meta, statusHTML(item.OK, fmt.Sprint(item.LatencyMS)+" ms"))
-	}
-	return out + `</div>`
-}
-
-func renderConnectivity(items []connectivityTest) string {
-	out := `<div class="rows">`
-	for _, item := range items {
-		meta := item.Error
-		if item.StatusCode > 0 {
-			meta = fmt.Sprintf("HTTP %d | %s", item.StatusCode, item.ExpectedNote)
-		}
-		out += rowHTML(item.Name, meta, statusHTML(item.Reachable, fmt.Sprint(item.LatencyMS)+" ms"))
-	}
-	return out + `</div>`
-}
-
-func rowHTML(name, meta, right string) string {
-	return `<div class="row"><div class="name">` + html.EscapeString(name) + `</div><div class="meta mono">` + html.EscapeString(meta) + `</div><div>` + right + `</div></div>`
-}
-
-func statusHTML(ok bool, text string) string {
-	className := "bad"
-	label := "失败"
-	if ok {
-		className = "ok"
-		label = "正常"
-	}
-	if text != "" {
-		label += " · " + html.EscapeString(text)
-	}
-	return `<span class="status ` + className + `">` + label + `</span>`
-}
-
-func chipsHTML(values []string) string {
-	if len(values) == 0 {
-		return ""
-	}
-	out := `<span class="chips">`
-	for _, value := range values {
-		out += `<span class="chip">` + html.EscapeString(value) + `</span>`
-	}
-	return out + `</span>`
-}
-
-func emptyHTML(text string) string {
-	return `<div class="meta">` + html.EscapeString(text) + `</div>`
-}
-
-func nonEmpty(values ...string) []string {
-	out := make([]string, 0, len(values))
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			out = append(out, strings.TrimSpace(value))
-		}
-	}
-	return out
 }
 
 func valueOr(value, fallback string) string {

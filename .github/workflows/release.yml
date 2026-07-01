@@ -18,6 +18,7 @@ jobs:
   build:
     name: Build ${{ matrix.goos }} ${{ matrix.goarch }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -28,9 +29,6 @@ jobs:
           - goos: linux
             goarch: arm64
             runner: ubuntu-24.04-arm
-          - goos: darwin
-            goarch: amd64
-            runner: macos-13
           - goos: darwin
             goarch: arm64
             runner: macos-14
@@ -65,7 +63,7 @@ jobs:
         with:
           msystem: MINGW64
           update: true
-          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-zip make
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-zip
           path-type: inherit
 
       - name: Build package
@@ -78,7 +76,6 @@ jobs:
           if [[ "${{ matrix.goos }}" == "windows" ]]; then
             export PATH="/mingw64/bin:$PATH"
           fi
-          zip --version
           bash scripts/package.sh
 
       - name: Upload artifact
@@ -92,7 +89,19 @@ jobs:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
+      - name: Set release tag
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "RELEASE_TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          elif [[ -n "${{ github.event.inputs.version }}" ]]; then
+            echo "RELEASE_TAG=v${{ github.event.inputs.version }}" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_TAG=v0.1.0" >> "$GITHUB_ENV"
+          fi
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -111,6 +120,7 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: |
             release-artifacts/*.zip
             release-artifacts/*.sha256
