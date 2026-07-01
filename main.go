@@ -58,7 +58,7 @@ import (
 
 const (
 	pluginName    = "CPA Diagnostics"
-	pluginVersion = "0.1.3"
+	pluginVersion = "0.1.4"
 	pluginAuthor  = "yuankc"
 	pluginRepo    = "https://github.com/yuankc/cliproxy-diagnostics-plugin"
 )
