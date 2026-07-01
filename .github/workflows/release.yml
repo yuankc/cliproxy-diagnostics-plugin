@@ -65,7 +65,7 @@ jobs:
         with:
           msystem: MINGW64
           update: true
-          install: mingw-w64-x86_64-gcc make zip
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-zip make
           path-type: inherit
 
       - name: Build package
@@ -78,6 +78,7 @@ jobs:
           if [[ "${{ matrix.goos }}" == "windows" ]]; then
             export PATH="/mingw64/bin:$PATH"
           fi
+          zip --version
           bash scripts/package.sh
 
       - name: Upload artifact
