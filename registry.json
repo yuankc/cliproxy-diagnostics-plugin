@@ -6,6 +6,7 @@
       "name": "Network Diagnostics",
       "description": "CPA网络检测, 显示公网IP、本地IP、DNS和OpenAI连接情况",
       "author": "yuankc",
+	  "version": "0.1.7",
       "repository": "https://github.com/yuankc/cpa-network-diagnostics-plugin",
       "homepage": "https://github.com/yuankc/cpa-network-diagnostics-plugin",
       "license": "MIT",
