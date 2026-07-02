@@ -100,3 +100,32 @@ func publicIPErrorMessage(err error) string {
 	}
 	return compactError(err)
 }
+
+func distinctIPsByFamily(checks []publicIPEndpoint) ([]string, []string) {
+	seen4 := make(map[string]struct{})
+	seen6 := make(map[string]struct{})
+	ipv4 := make([]string, 0)
+	ipv6 := make([]string, 0)
+	for _, check := range checks {
+		parsed := net.ParseIP(strings.TrimSpace(check.IP))
+		if parsed == nil {
+			continue
+		}
+		if parsed.To4() != nil {
+			key := parsed.String()
+			if _, ok := seen4[key]; ok {
+				continue
+			}
+			seen4[key] = struct{}{}
+			ipv4 = append(ipv4, key)
+			continue
+		}
+		key := parsed.String()
+		if _, ok := seen6[key]; ok {
+			continue
+		}
+		seen6[key] = struct{}{}
+		ipv6 = append(ipv6, key)
+	}
+	return ipv4, ipv6
+}

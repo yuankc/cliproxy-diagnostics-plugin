@@ -16,6 +16,7 @@ type diagnostics struct {
 	CheckedAt       string             `json:"checked_at"`
 	Runtime         runtimeInfo        `json:"runtime"`
 	Proxy           proxyInfo          `json:"proxy"`
+	Egress          egressComparison   `json:"egress"`
 	LocalIPs        []localIP          `json:"local_ips"`
 	OutboundSources []outboundSource   `json:"outbound_sources"`
 	PublicIP        publicIPResult     `json:"public_ip"`
@@ -24,7 +25,6 @@ type diagnostics struct {
 	Geo             geoConsistency     `json:"geo_consistency"`
 	DNS             []dnsResult        `json:"dns"`
 	Connectivity    []connectivityTest `json:"connectivity"`
-	Risk            riskSummary        `json:"risk"`
 	DurationMS      int64              `json:"duration_ms"`
 }
 
@@ -49,6 +49,17 @@ type proxyVariable struct {
 	Set   bool   `json:"set"`
 }
 
+type egressComparison struct {
+	HostHTTPAvailable bool           `json:"host_http_available"`
+	ActivePath        string         `json:"active_path"`
+	Direct            publicIPResult `json:"direct"`
+	Host              publicIPResult `json:"host"`
+	SameIP            bool           `json:"same_ip"`
+	Compared          bool           `json:"compared"`
+	Signals           []string       `json:"signals"`
+	Note              string         `json:"note"`
+}
+
 type localIP struct {
 	Interface string `json:"interface"`
 	Address   string `json:"address"`
@@ -67,6 +78,8 @@ type outboundSource struct {
 
 type publicIPResult struct {
 	IP        string             `json:"ip,omitempty"`
+	Path      string             `json:"path,omitempty"`
+	Type      string             `json:"type,omitempty"`
 	Country   string             `json:"country,omitempty"`
 	Region    string             `json:"region,omitempty"`
 	City      string             `json:"city,omitempty"`
@@ -78,8 +91,10 @@ type publicIPResult struct {
 
 type publicIPEndpoint struct {
 	Name      string `json:"name"`
+	Path      string `json:"path,omitempty"`
 	URL       string `json:"url"`
 	IP        string `json:"ip,omitempty"`
+	Type      string `json:"type,omitempty"`
 	Country   string `json:"country,omitempty"`
 	Region    string `json:"region,omitempty"`
 	City      string `json:"city,omitempty"`
@@ -99,6 +114,7 @@ type dnsResult struct {
 
 type connectivityTest struct {
 	Name         string `json:"name"`
+	Path         string `json:"path,omitempty"`
 	URL          string `json:"url"`
 	StatusCode   int    `json:"status_code,omitempty"`
 	LatencyMS    int64  `json:"latency_ms,omitempty"`
@@ -108,7 +124,7 @@ type connectivityTest struct {
 	Error        string `json:"error,omitempty"`
 }
 
-// ipRiskProfile combines multiple IP reputation sources to identify high-risk egress IP types.
+// ipRiskProfile combines multiple IP reputation sources into factual egress IP labels.
 type ipRiskProfile struct {
 	IP         string        `json:"ip,omitempty"`
 	Type       string        `json:"type,omitempty"` // residential / hosting / mobile / business / unknown
@@ -128,6 +144,7 @@ type ipRiskProfile struct {
 
 type ipRiskCheck struct {
 	Name      string `json:"name"`
+	Path      string `json:"path,omitempty"`
 	URL       string `json:"url"`
 	Type      string `json:"type,omitempty"`
 	IsDatacen bool   `json:"is_datacenter"`
@@ -145,6 +162,7 @@ type ipRiskCheck struct {
 
 // openAIAvailability captures OpenAI/ChatGPT availability signals beyond simple connectivity.
 type openAIAvailability struct {
+	Path               string `json:"path,omitempty"`
 	Supported          bool   `json:"supported"`
 	UnsupportedCountry bool   `json:"unsupported_country"`
 	CFCountry          string `json:"cf_country,omitempty"` // Country detected by chatgpt.com Cloudflare edge
@@ -165,11 +183,4 @@ type geoConsistency struct {
 	TimezoneUTC  string   `json:"timezone_utc,omitempty"`
 	Consistent   bool     `json:"consistent"`
 	Signals      []string `json:"signals"`
-}
-
-type riskSummary struct {
-	Level   string   `json:"level"`
-	Label   string   `json:"label"`
-	Signals []string `json:"signals"`
-	Note    string   `json:"note"`
 }

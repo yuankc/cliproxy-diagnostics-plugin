@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -15,11 +16,15 @@ import (
 
 var (
 	diagnosticsCacheMu      sync.Mutex
-	diagnosticsCacheData    diagnostics
-	diagnosticsCacheExpires time.Time
+	diagnosticsCacheData    = make(map[probeMode]diagnosticsCacheEntry)
 	diagnosticsCacheLoading bool
 	diagnosticsCacheCond    = sync.NewCond(&diagnosticsCacheMu)
 )
+
+type diagnosticsCacheEntry struct {
+	data    diagnostics
+	expires time.Time
+}
 
 func handleMethod(method string, payload []byte) ([]byte, error) {
 	switch method {
@@ -28,19 +33,20 @@ func handleMethod(method string, payload []byte) ([]byte, error) {
 	case pluginabi.MethodManagementRegister:
 		return okEnvelope(pluginapi.ManagementRegistrationResponse{
 			Routes: []pluginapi.ManagementRoute{
-				{Method: http.MethodGet, Path: "/diagnostics/status", Description: "Returns CPA process network diagnostics as JSON."},
+				{Method: http.MethodGet, Path: "/diagnostics/status", Description: "Returns CPA process network check results as JSON."},
 			},
 			Resources: []pluginapi.ResourceRoute{
-				{Path: "/dashboard", Menu: "网络诊断", Description: "显示公网 IP、本地 IP、DNS 和 OpenAI 连接情况。"},
-				{Path: "/status", Description: "Returns CPA process network diagnostics as JSON for the diagnostics dashboard."},
-				{Path: "/status/runtime", Description: "Returns runtime, local IP, and proxy diagnostics."},
-				{Path: "/status/public-ip", Description: "Returns public IP diagnostics."},
-				{Path: "/status/ip-risk", Description: "Returns IP reputation diagnostics."},
-				{Path: "/status/openai", Description: "Returns OpenAI availability diagnostics."},
-				{Path: "/status/geo", Description: "Returns geographic consistency diagnostics."},
-				{Path: "/status/dns", Description: "Returns DNS diagnostics."},
-				{Path: "/status/connectivity", Description: "Returns HTTP connectivity diagnostics."},
-				{Path: "/status/outbound", Description: "Returns outbound source address diagnostics."},
+				{Path: "/dashboard", Menu: "网络检测", Description: "显示公网 IP、本地 IP、DNS 和 OpenAI 连接情况。"},
+				{Path: "/status", Description: "Returns CPA process network check results as JSON for the network check dashboard."},
+				{Path: "/status/runtime", Description: "Returns runtime, local IP, and proxy check results."},
+				{Path: "/status/egress", Description: "Returns direct vs host egress check results."},
+				{Path: "/status/public-ip", Description: "Returns public IP check results."},
+				{Path: "/status/ip-risk", Description: "Returns IP reputation check results."},
+				{Path: "/status/openai", Description: "Returns OpenAI availability check results."},
+				{Path: "/status/geo", Description: "Returns geographic consistency check results."},
+				{Path: "/status/dns", Description: "Returns DNS check results."},
+				{Path: "/status/connectivity", Description: "Returns HTTP connectivity check results."},
+				{Path: "/status/outbound", Description: "Returns outbound source address check results."},
 			},
 		})
 	case pluginabi.MethodManagementHandle:
@@ -72,7 +78,7 @@ func registrationPayload() registration {
 
 func handleManagement(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	if kind := statusPathKind(req.Path); kind != "" {
-		return diagnosticsJSONResponse(kind)
+		return diagnosticsJSONResponse(kind, probeModeFromRequest(req))
 	}
 	return pluginapi.ManagementResponse{
 		StatusCode: http.StatusOK,
@@ -84,8 +90,8 @@ func handleManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRespo
 	}
 }
 
-func diagnosticsJSONResponse(kind string) pluginapi.ManagementResponse {
-	body, errMarshal := json.MarshalIndent(diagnosticsPayload(kind), "", "  ")
+func diagnosticsJSONResponse(kind string, mode probeMode) pluginapi.ManagementResponse {
+	body, errMarshal := json.MarshalIndent(diagnosticsPayload(kind, mode), "", "  ")
 	if errMarshal != nil {
 		return textResponse(http.StatusInternalServerError, errMarshal.Error())
 	}
@@ -104,6 +110,9 @@ func isStatusPath(path string) bool {
 }
 
 func statusPathKind(path string) string {
+	if index := strings.Index(path, "?"); index >= 0 {
+		path = path[:index]
+	}
 	cleaned := "/" + strings.Trim(strings.TrimSuffix(path, "/"), "/")
 	bases := []string{"/status", "/diagnostics/status", "/v0/management/diagnostics/status", "/v0/resource/plugins/diagnostics/status"}
 	for _, base := range bases {
@@ -113,7 +122,7 @@ func statusPathKind(path string) string {
 		if strings.HasPrefix(cleaned, base+"/") {
 			kind := strings.TrimPrefix(cleaned, base+"/")
 			switch kind {
-			case "runtime", "proxy", "public-ip", "ip-risk", "openai", "geo", "dns", "connectivity", "outbound":
+			case "runtime", "proxy", "egress", "public-ip", "ip-risk", "openai", "geo", "dns", "connectivity", "outbound":
 				return kind
 			}
 		}
@@ -121,7 +130,28 @@ func statusPathKind(path string) string {
 	return ""
 }
 
-func diagnosticsPayload(kind string) any {
+func probeModeFromRequest(req pluginapi.ManagementRequest) probeMode {
+	if mode := probeModeFromString(req.Query.Get("network")); mode != "" {
+		return mode
+	}
+	if mode := probeModeFromString(req.Query.Get("mode")); mode != "" {
+		return mode
+	}
+	if index := strings.Index(req.Path, "?"); index >= 0 && index+1 < len(req.Path) {
+		values, errParse := url.ParseQuery(req.Path[index+1:])
+		if errParse == nil {
+			if mode := probeModeFromString(values.Get("network")); mode != "" {
+				return mode
+			}
+			if mode := probeModeFromString(values.Get("mode")); mode != "" {
+				return mode
+			}
+		}
+	}
+	return probeModeDirect
+}
+
+func diagnosticsPayload(kind string, mode probeMode) any {
 	switch kind {
 	case "runtime":
 		hostname, _ := os.Hostname()
@@ -134,39 +164,46 @@ func diagnosticsPayload(kind string) any {
 		}
 	case "proxy":
 		return collectProxyInfo()
+	case "egress":
+		directPublicIP := detectPublicIPFor(probeModeDirect)
+		hostPublicIP := publicIPResult{}
+		if hostHTTPAvailable() {
+			hostPublicIP = detectPublicIPFor(probeModeHost)
+		}
+		return compareEgress(directPublicIP, hostPublicIP, mode)
 	case "public-ip":
-		return detectPublicIP()
+		return detectPublicIPFor(mode)
 	case "ip-risk":
-		publicIP := detectPublicIP()
+		publicIP := detectPublicIPFor(mode)
 		payload := map[string]any{"public_ip": publicIP, "ip_risk": ipRiskProfile{}}
 		if publicIP.IP != "" {
-			payload["ip_risk"] = detectIPRisk(publicIP.IP)
+			payload["ip_risk"] = detectIPRiskFor(mode, publicIP.IP)
 		}
 		return payload
 	case "openai":
-		return detectOpenAIAvailability()
+		return detectOpenAIAvailabilityFor(mode)
 	case "geo":
 		tzName, tzUTC := localTimezone()
-		publicIP := detectPublicIP()
-		openAI := detectOpenAIAvailability()
+		publicIP := detectPublicIPFor(mode)
+		openAI := detectOpenAIAvailabilityFor(mode)
 		return evaluateGeoConsistency(publicIP, openAI, tzName, tzUTC)
 	case "dns":
 		return checkDNS([]string{"chatgpt.com", "api.openai.com", "auth.openai.com", "cdn.openai.com"})
 	case "connectivity":
-		return checkConnectivity()
+		return checkConnectivityFor(mode)
 	case "outbound":
 		return detectOutboundSources([]string{"api.openai.com:443", "chatgpt.com:443", "1.1.1.1:443"})
 	default:
-		return cachedDiagnostics()
+		return cachedDiagnostics(mode)
 	}
 }
 
-func cachedDiagnostics() diagnostics {
+func cachedDiagnostics(mode probeMode) diagnostics {
 	now := time.Now()
 	diagnosticsCacheMu.Lock()
 	for {
-		if !diagnosticsCacheExpires.IsZero() && now.Before(diagnosticsCacheExpires) {
-			cached := diagnosticsCacheData
+		if cache, ok := diagnosticsCacheData[mode]; ok && !cache.expires.IsZero() && now.Before(cache.expires) {
+			cached := cache.data
 			diagnosticsCacheMu.Unlock()
 			return cached
 		}
@@ -174,11 +211,10 @@ func cachedDiagnostics() diagnostics {
 			diagnosticsCacheLoading = true
 			diagnosticsCacheMu.Unlock()
 
-			data := collectDiagnostics()
+			data := collectDiagnosticsFor(mode)
 
 			diagnosticsCacheMu.Lock()
-			diagnosticsCacheData = data
-			diagnosticsCacheExpires = time.Now().Add(30 * time.Second)
+			diagnosticsCacheData[mode] = diagnosticsCacheEntry{data: data, expires: time.Now().Add(30 * time.Second)}
 			diagnosticsCacheLoading = false
 			diagnosticsCacheCond.Broadcast()
 			diagnosticsCacheMu.Unlock()

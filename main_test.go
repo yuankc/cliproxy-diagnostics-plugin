@@ -3,9 +3,12 @@ package main
 import (
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 func TestIsStatusPath(t *testing.T) {
@@ -26,6 +29,23 @@ func TestIsStatusPath(t *testing.T) {
 		if got := isStatusPath(tc.path); got != tc.want {
 			t.Fatalf("isStatusPath(%q) = %v, want %v", tc.path, got, tc.want)
 		}
+	}
+}
+
+func TestProbeModeFromRequestDefaultsToDirect(t *testing.T) {
+	if got := probeModeFromRequest(pluginapi.ManagementRequest{}); got != probeModeDirect {
+		t.Fatalf("probeModeFromRequest() = %q, want %q", got, probeModeDirect)
+	}
+}
+
+func TestProbeModeFromRequestQuery(t *testing.T) {
+	req := pluginapi.ManagementRequest{Query: url.Values{"network": {"host"}}}
+	if got := probeModeFromRequest(req); got != probeModeHost {
+		t.Fatalf("probeModeFromRequest(query) = %q, want %q", got, probeModeHost)
+	}
+	req = pluginapi.ManagementRequest{Path: "/status/public-ip?network=local"}
+	if got := probeModeFromRequest(req); got != probeModeDirect {
+		t.Fatalf("probeModeFromRequest(path query) = %q, want %q", got, probeModeDirect)
 	}
 }
 
@@ -57,14 +77,14 @@ func TestSanitizeProxyValue(t *testing.T) {
 	}
 }
 func TestParseIPResponse(t *testing.T) {
-	ip, country, region, city, org := parseIPResponse([]byte(`{"ip":"203.0.113.8","country":"US","region":"CA","city":"San Francisco","org":"Example ISP"}`))
-	if ip != "203.0.113.8" || country != "US" || region != "CA" || city != "San Francisco" || org != "Example ISP" {
-		t.Fatalf("unexpected parsed response: ip=%q country=%q region=%q city=%q org=%q", ip, country, region, city, org)
+	ip, ipType, country, region, city, org := parseIPResponse([]byte(`{"ip":"203.0.113.8","country":"US","region":"CA","city":"San Francisco","org":"Example ISP","asn":{"type":"isp"}}`))
+	if ip != "203.0.113.8" || ipType != "residential" || country != "US" || region != "CA" || city != "San Francisco" || org != "Example ISP" {
+		t.Fatalf("unexpected parsed response: ip=%q type=%q country=%q region=%q city=%q org=%q", ip, ipType, country, region, city, org)
 	}
 
-	ip, country, region, city, org = parseIPResponse([]byte(`"198.51.100.4"`))
-	if ip != "198.51.100.4" || country != "" || region != "" || city != "" || org != "" {
-		t.Fatalf("unexpected plain IP parse: ip=%q country=%q region=%q city=%q org=%q", ip, country, region, city, org)
+	ip, ipType, country, region, city, org = parseIPResponse([]byte(`"198.51.100.4"`))
+	if ip != "198.51.100.4" || ipType != "" || country != "" || region != "" || city != "" || org != "" {
+		t.Fatalf("unexpected plain IP parse: ip=%q type=%q country=%q region=%q city=%q org=%q", ip, ipType, country, region, city, org)
 	}
 }
 

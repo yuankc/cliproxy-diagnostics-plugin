@@ -18,14 +18,25 @@ import (
 
 var httpClient = &http.Client{Timeout: 5 * time.Second}
 
+type probeMode string
+
+const (
+	probeModeDirect probeMode = "direct"
+	probeModeHost   probeMode = "host"
+)
+
 func collectDiagnostics() diagnostics {
+	return collectDiagnosticsFor(probeModeDirect)
+}
+
+func collectDiagnosticsFor(mode probeMode) diagnostics {
 	started := time.Now()
 	hostname, _ := os.Hostname()
 	tzName, tzUTC := localTimezone()
 	proxy := collectProxyInfo()
 
 	localIPs := collectLocalIPs()
-	publicIP, dnsResults, connectivity, outbound := publicIPResult{}, []dnsResult{}, []connectivityTest{}, []outboundSource{}
+	publicIP, directPublicIP, hostPublicIP, dnsResults, connectivity, outbound := publicIPResult{}, publicIPResult{}, publicIPResult{}, []dnsResult{}, []connectivityTest{}, []outboundSource{}
 	openAI := openAIAvailability{}
 
 	// Run independent probes concurrently.
@@ -33,7 +44,11 @@ func collectDiagnostics() diagnostics {
 	wg.Add(5)
 	go func() {
 		defer wg.Done()
-		publicIP = detectPublicIP()
+		directPublicIP = detectPublicIPFor(probeModeDirect)
+		if hostHTTPAvailable() {
+			hostPublicIP = detectPublicIPFor(probeModeHost)
+		}
+		publicIP = activePublicIP(directPublicIP, hostPublicIP, mode)
 	}()
 	go func() {
 		defer wg.Done()
@@ -41,7 +56,7 @@ func collectDiagnostics() diagnostics {
 	}()
 	go func() {
 		defer wg.Done()
-		connectivity = checkConnectivity()
+		connectivity = checkConnectivityFor(mode)
 	}()
 	go func() {
 		defer wg.Done()
@@ -49,14 +64,14 @@ func collectDiagnostics() diagnostics {
 	}()
 	go func() {
 		defer wg.Done()
-		openAI = detectOpenAIAvailability()
+		openAI = detectOpenAIAvailabilityFor(mode)
 	}()
 	wg.Wait()
 
 	// Run probes that depend on the detected public IP.
 	ipRisk := ipRiskProfile{}
 	if publicIP.IP != "" {
-		ipRisk = detectIPRisk(publicIP.IP)
+		ipRisk = detectIPRiskFor(mode, publicIP.IP)
 	}
 	geo := evaluateGeoConsistency(publicIP, openAI, tzName, tzUTC)
 
@@ -71,6 +86,7 @@ func collectDiagnostics() diagnostics {
 			TimezoneUTC:  tzUTC,
 		},
 		Proxy:           proxy,
+		Egress:          compareEgress(directPublicIP, hostPublicIP, mode),
 		LocalIPs:        localIPs,
 		OutboundSources: outbound,
 		PublicIP:        publicIP,
@@ -81,7 +97,6 @@ func collectDiagnostics() diagnostics {
 		Connectivity:    connectivity,
 		DurationMS:      time.Since(started).Milliseconds(),
 	}
-	out.Risk = summarizeRisk(out)
 	return out
 }
 
@@ -96,6 +111,65 @@ func localTimezone() (name string, utc string) {
 	hours := offset / 3600
 	minutes := (offset % 3600) / 60
 	return zone, fmt.Sprintf("UTC%s%02d:%02d", sign, hours, minutes)
+}
+
+func activeProbeMode() probeMode {
+	return probeModeDirect
+}
+
+func probeModeFromString(value string) probeMode {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case string(probeModeHost), "proxy", "cpa":
+		return probeModeHost
+	case string(probeModeDirect), "local", "native":
+		return probeModeDirect
+	default:
+		return ""
+	}
+}
+
+func modeFromPath(path string) probeMode {
+	if path == string(probeModeHost) {
+		return probeModeHost
+	}
+	return probeModeDirect
+}
+
+func activePublicIP(direct publicIPResult, host publicIPResult, mode probeMode) publicIPResult {
+	if mode == probeModeHost {
+		return host
+	}
+	return direct
+}
+
+func compareEgress(direct publicIPResult, host publicIPResult, mode probeMode) egressComparison {
+	out := egressComparison{
+		HostHTTPAvailable: hostHTTPAvailable(),
+		ActivePath:        string(mode),
+		Direct:            direct,
+		Host:              host,
+		Signals:           make([]string, 0),
+	}
+	if !out.HostHTTPAvailable {
+		out.Note = "当前运行环境没有可用的宿主 HTTP 回调，检测只能使用插件直连通道。"
+		out.Signals = append(out.Signals, "宿主 HTTP 回调不可用，无法验证 CPA proxy-url 是否生效")
+		return out
+	}
+	if direct.IP != "" && host.IP != "" {
+		out.Compared = true
+		out.SameIP = direct.IP == host.IP
+		if out.SameIP {
+			out.Signals = append(out.Signals, "direct 与 host 出口 IP 相同，CPA 全局代理可能未配置、未生效，或代理出口与直连出口一致")
+		} else {
+			out.Signals = append(out.Signals, "direct 与 host 出口 IP 不同，CPA 宿主出站策略正在改变出口路径")
+		}
+	} else if host.IP == "" {
+		out.Signals = append(out.Signals, "host 通道未获取到出口 IP，CPA 代理或宿主 HTTP 出站可能异常")
+	} else if direct.IP == "" {
+		out.Signals = append(out.Signals, "direct 通道未获取到出口 IP，但 host 通道可用，裸网络可能受限或仅代理可出站")
+	}
+	out.Note = "direct 表示插件进程裸网络；host 表示通过 CPA 宿主 HTTP 回调发起请求，会应用 CPA 宿主出站策略。"
+	return out
 }
 
 func collectProxyInfo() proxyInfo {
@@ -138,6 +212,47 @@ func sanitizeProxyValue(value string) string {
 		return "***@" + value[at+1:]
 	}
 	return value
+}
+
+func doHTTPRequest(mode probeMode, req *http.Request, bodyLimit int64) ([]byte, int, http.Header, int64, error) {
+	if req == nil {
+		return nil, 0, nil, 0, fmt.Errorf("request is nil")
+	}
+	started := time.Now()
+	if mode == probeModeHost {
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		defer cancel()
+		resp, errDo := hostHTTPDo(ctx, hostHTTPRequest{
+			Method:  req.Method,
+			URL:     req.URL.String(),
+			Headers: req.Header.Clone(),
+		})
+		latencyMS := time.Since(started).Milliseconds()
+		if errDo != nil {
+			return nil, 0, nil, latencyMS, errDo
+		}
+		body := resp.Body
+		if bodyLimit > 0 && int64(len(body)) > bodyLimit {
+			body = body[:bodyLimit]
+		}
+		return body, resp.StatusCode, resp.Headers, latencyMS, nil
+	}
+
+	resp, errDo := httpClient.Do(req)
+	latencyMS := time.Since(started).Milliseconds()
+	if errDo != nil {
+		return nil, 0, nil, latencyMS, errDo
+	}
+	defer closeBody(resp.Body)
+	limit := bodyLimit
+	if limit <= 0 {
+		limit = 64 * 1024
+	}
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, limit))
+	if errRead != nil {
+		return nil, resp.StatusCode, resp.Header.Clone(), latencyMS, errRead
+	}
+	return body, resp.StatusCode, resp.Header.Clone(), latencyMS, nil
 }
 
 func collectLocalIPs() []localIP {
@@ -227,15 +342,23 @@ func probeOutboundSource(target string) outboundSource {
 }
 
 func detectPublicIP() publicIPResult {
+	if hostHTTPAvailable() {
+		host := detectPublicIPFor(probeModeHost)
+		if host.IP != "" {
+			return host
+		}
+	}
+	return detectPublicIPFor(probeModeDirect)
+}
+
+func detectPublicIPFor(mode probeMode) publicIPResult {
 	endpoints := []struct {
 		name string
 		url  string
 	}{
-		{name: "ipify", url: "https://api.ipify.org?format=json"},
 		{name: "ifconfig.co", url: "https://ifconfig.co/json"},
 		{name: "ipinfo", url: "https://ipinfo.io/json"},
 		{name: "ip.sb", url: "https://api.ip.sb/geoip"},
-		{name: "ipapi.co", url: "https://ipapi.co/json/"},
 		{name: "ipwho.is", url: "https://ipwho.is/"},
 	}
 	checks := make([]publicIPEndpoint, len(endpoints))
@@ -244,15 +367,16 @@ func detectPublicIP() publicIPResult {
 		wg.Add(1)
 		go func(index int, name string, url string) {
 			defer wg.Done()
-			checks[index] = fetchPublicIP(name, url)
+			checks[index] = fetchPublicIPFor(mode, name, url)
 		}(index, endpoint.name, endpoint.url)
 	}
 	wg.Wait()
 
-	result := publicIPResult{Checks: checks}
+	result := publicIPResult{Path: string(mode), Checks: checks}
 	for _, check := range checks {
 		if result.IP == "" && check.OK && check.IP != "" {
 			result.IP = check.IP
+			result.Type = check.Type
 			result.Country = check.Country
 			result.Region = check.Region
 			result.City = check.City
@@ -265,7 +389,11 @@ func detectPublicIP() publicIPResult {
 }
 
 func fetchPublicIP(name, url string) publicIPEndpoint {
-	check := publicIPEndpoint{Name: name, URL: url}
+	return fetchPublicIPFor(activeProbeMode(), name, url)
+}
+
+func fetchPublicIPFor(mode probeMode, name, url string) publicIPEndpoint {
+	check := publicIPEndpoint{Name: name, Path: string(mode), URL: url}
 	req, errReq := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
 	if errReq != nil {
 		check.Error = compactError(errReq)
@@ -274,16 +402,16 @@ func fetchPublicIP(name, url string) publicIPEndpoint {
 	req.Header.Set("accept", "application/json,text/plain;q=0.8")
 	req.Header.Set("user-agent", "cliproxy-diagnostics-plugin/"+pluginVersion)
 
-	var resp *http.Response
 	var errDo error
-	started := time.Now()
+	var body []byte
+	var status int
+	var latency int64
 	for attempt := 0; attempt < 2; attempt++ {
 		if attempt > 0 {
 			req = req.Clone(context.Background())
-			started = time.Now()
 		}
-		resp, errDo = httpClient.Do(req)
-		check.LatencyMS = time.Since(started).Milliseconds()
+		body, status, _, latency, errDo = doHTTPRequest(mode, req, 64*1024)
+		check.LatencyMS = latency
 		if errDo == nil || !retryablePublicIPError(errDo) {
 			break
 		}
@@ -292,18 +420,13 @@ func fetchPublicIP(name, url string) publicIPEndpoint {
 		check.Error = publicIPErrorMessage(errDo)
 		return check
 	}
-	defer closeBody(resp.Body)
-	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-	if errRead != nil {
-		check.Error = publicIPErrorMessage(errRead)
+	if status < 200 || status >= 300 {
+		check.Error = fmt.Sprintf("HTTP %d", status)
 		return check
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		check.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
-		return check
-	}
-	ip, country, region, city, org := parseIPResponse(body)
+	ip, ipType, country, region, city, org := parseIPResponse(body)
 	check.IP = ip
+	check.Type = ipType
 	check.Country = country
 	check.Region = region
 	check.City = city
@@ -315,19 +438,20 @@ func fetchPublicIP(name, url string) publicIPEndpoint {
 	return check
 }
 
-func parseIPResponse(body []byte) (ip string, country string, region string, city string, org string) {
+func parseIPResponse(body []byte) (ip string, ipType string, country string, region string, city string, org string) {
 	text := strings.TrimSpace(string(body))
 	if parsed := net.ParseIP(strings.Trim(text, "\"")); parsed != nil {
-		return parsed.String(), "", "", "", ""
+		return parsed.String(), "", "", "", "", ""
 	}
 	var payload map[string]any
 	if errJSON := json.Unmarshal(body, &payload); errJSON != nil {
-		return "", "", "", "", ""
+		return "", "", "", "", "", ""
 	}
 	ip = firstString(payload, "ip", "query", "origin", "address")
 	if parsed := net.ParseIP(ip); parsed != nil {
 		ip = parsed.String()
 	}
+	ipType = publicIPTypeFromPayload(payload)
 	country = firstString(payload, "country", "country_code", "countryCode")
 	region = firstString(payload, "region", "region_name", "regionName")
 	city = firstString(payload, "city")
@@ -338,7 +462,28 @@ func parseIPResponse(body []byte) (ip string, country string, region string, cit
 	if org == "" {
 		org = nestedString(payload, "asn", "name")
 	}
-	return ip, country, region, city, org
+	return ip, ipType, country, region, city, org
+}
+
+func publicIPTypeFromPayload(payload map[string]any) string {
+	for _, path := range [][2]string{
+		{"connection", "type"},
+		{"asn", "type"},
+		{"company", "type"},
+	} {
+		if value := normalizeIPType(nestedString(payload, path[0], path[1])); value != "unknown" {
+			return value
+		}
+	}
+	if privacy, ok := payload["privacy"].(map[string]any); ok {
+		switch {
+		case boolField(privacy, "hosting"):
+			return "hosting"
+		case boolField(privacy, "vpn") || boolField(privacy, "proxy") || boolField(privacy, "tor"):
+			return "hosting"
+		}
+	}
+	return ""
 }
 
 func firstString(payload map[string]any, keys ...string) string {
@@ -395,6 +540,10 @@ func checkDNS(hosts []string) []dnsResult {
 }
 
 func checkConnectivity() []connectivityTest {
+	return checkConnectivityFor(activeProbeMode())
+}
+
+func checkConnectivityFor(mode probeMode) []connectivityTest {
 	targets := []struct {
 		name string
 		url  string
@@ -411,7 +560,7 @@ func checkConnectivity() []connectivityTest {
 		wg.Add(1)
 		go func(index int, name, url, note string) {
 			defer wg.Done()
-			results[index] = probeHTTP(name, url, note)
+			results[index] = probeHTTPFor(mode, name, url, note)
 		}(index, target.name, target.url, target.note)
 	}
 	wg.Wait()
@@ -419,27 +568,28 @@ func checkConnectivity() []connectivityTest {
 }
 
 func probeHTTP(name, url, note string) connectivityTest {
-	started := time.Now()
-	item := connectivityTest{Name: name, URL: url, ExpectedNote: note}
+	return probeHTTPFor(activeProbeMode(), name, url, note)
+}
+
+func probeHTTPFor(mode probeMode, name, url, note string) connectivityTest {
+	item := connectivityTest{Name: name, Path: string(mode), URL: url, ExpectedNote: note}
 	req, errReq := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
 	if errReq != nil {
 		item.Error = compactError(errReq)
 		return item
 	}
 	req.Header.Set("user-agent", "cliproxy-diagnostics-plugin/"+pluginVersion)
-	resp, errDo := httpClient.Do(req)
-	item.LatencyMS = time.Since(started).Milliseconds()
+	body, status, _, latency, errDo := doHTTPRequest(mode, req, 16*1024)
+	item.LatencyMS = latency
 	if errDo != nil {
 		item.Error = compactError(errDo)
 		return item
 	}
-	defer closeBody(resp.Body)
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
-	item.StatusCode = resp.StatusCode
+	item.StatusCode = status
 	// Reaching the site is not the same as the service being usable.
-	item.Reachable = resp.StatusCode > 0 && resp.StatusCode < 500
+	item.Reachable = status > 0 && status < 500
 	// Detect Cloudflare/OpenAI block pages for datacenter or restricted IPs.
-	item.Blocked = isBlockedResponse(resp.StatusCode, body)
+	item.Blocked = isBlockedResponse(status, body)
 	return item
 }
 
@@ -476,6 +626,10 @@ func bodyHasBlockMarker(body []byte) bool {
 
 // detectIPRisk profiles the public IP with multiple reputation sources.
 func detectIPRisk(ip string) ipRiskProfile {
+	return detectIPRiskFor(activeProbeMode(), ip)
+}
+
+func detectIPRiskFor(mode probeMode, ip string) ipRiskProfile {
 	endpoints := []struct {
 		name string
 		url  string
@@ -489,7 +643,7 @@ func detectIPRisk(ip string) ipRiskProfile {
 		wg.Add(1)
 		go func(index int, name, url string) {
 			defer wg.Done()
-			checks[index] = fetchIPRisk(name, url)
+			checks[index] = fetchIPRiskFor(mode, name, url)
 		}(index, endpoint.name, endpoint.url)
 	}
 	wg.Wait()
@@ -500,7 +654,7 @@ func detectIPRisk(ip string) ipRiskProfile {
 			continue
 		}
 		profile.Determined = true
-		// Merge boolean risk signals conservatively.
+		// Merge boolean labels conservatively.
 		profile.IsDatacen = profile.IsDatacen || check.IsDatacen
 		profile.IsProxy = profile.IsProxy || check.IsProxy
 		profile.IsVPN = profile.IsVPN || check.IsVPN
@@ -540,8 +694,12 @@ func ipRiskHTTPError(name string, status int) string {
 	return fmt.Sprintf("HTTP %d", status)
 }
 func fetchIPRisk(name, url string) ipRiskCheck {
-	check := ipRiskCheck{Name: name, URL: url}
-	body, status, latency, err := httpGetJSON(url)
+	return fetchIPRiskFor(activeProbeMode(), name, url)
+}
+
+func fetchIPRiskFor(mode probeMode, name, url string) ipRiskCheck {
+	check := ipRiskCheck{Name: name, Path: string(mode), URL: url}
+	body, status, latency, err := httpGetJSONFor(mode, url)
 	check.LatencyMS = latency
 	if err != nil {
 		check.Error = publicIPErrorMessage(err)
@@ -631,7 +789,11 @@ func normalizeIPType(raw string) string {
 
 // detectOpenAIAvailability checks OpenAI-side availability signals, not just connectivity.
 func detectOpenAIAvailability() openAIAvailability {
-	result := openAIAvailability{}
+	return detectOpenAIAvailabilityFor(activeProbeMode())
+}
+
+func detectOpenAIAvailabilityFor(mode probeMode) openAIAvailability {
+	result := openAIAvailability{Path: string(mode)}
 	started := time.Now()
 
 	var wg sync.WaitGroup
@@ -642,14 +804,14 @@ func detectOpenAIAvailability() openAIAvailability {
 	var complianceErr error
 	go func() {
 		defer wg.Done()
-		complianceBody, complianceStatus, _, complianceErr = httpGetJSON("https://api.openai.com/compliance/cookie_requirements")
+		complianceBody, complianceStatus, _, complianceErr = httpGetJSONFor(mode, "https://api.openai.com/compliance/cookie_requirements")
 	}()
 
 	var traceText string
 	var traceErr error
 	go func() {
 		defer wg.Done()
-		traceText, traceErr = fetchCFTrace("https://chatgpt.com/cdn-cgi/trace")
+		traceText, traceErr = fetchCFTraceFor(mode, "https://chatgpt.com/cdn-cgi/trace")
 	}()
 	wg.Wait()
 	result.LatencyMS = time.Since(started).Milliseconds()
@@ -696,23 +858,21 @@ func detectOpenAIAvailability() openAIAvailability {
 }
 
 func fetchCFTrace(url string) (string, error) {
+	return fetchCFTraceFor(activeProbeMode(), url)
+}
+
+func fetchCFTraceFor(mode probeMode, url string) (string, error) {
 	req, errReq := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
 	if errReq != nil {
 		return "", errReq
 	}
 	req.Header.Set("user-agent", "cliproxy-diagnostics-plugin/"+pluginVersion)
-	resp, errDo := httpClient.Do(req)
+	body, status, _, _, errDo := doHTTPRequest(mode, req, 4096)
 	if errDo != nil {
 		return "", errDo
 	}
-	defer closeBody(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		return "", fmt.Errorf("cloudflare trace HTTP %d", resp.StatusCode)
-	}
-	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if errRead != nil {
-		return "", errRead
+	if status < 200 || status >= 300 {
+		return "", fmt.Errorf("cloudflare trace HTTP %d", status)
 	}
 	return string(body), nil
 }
@@ -757,6 +917,10 @@ func evaluateGeoConsistency(pub publicIPResult, openAI openAIAvailability, tzNam
 
 // httpGetJSON performs a GET request and returns body, status, and latency.
 func httpGetJSON(url string) (body []byte, status int, latencyMS int64, err error) {
+	return httpGetJSONFor(activeProbeMode(), url)
+}
+
+func httpGetJSONFor(mode probeMode, url string) (body []byte, status int, latencyMS int64, err error) {
 	req, errReq := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
 	if errReq != nil {
 		return nil, 0, 0, errReq
@@ -764,16 +928,12 @@ func httpGetJSON(url string) (body []byte, status int, latencyMS int64, err erro
 	req.Header.Set("accept", "application/json,text/plain;q=0.8")
 	req.Header.Set("user-agent", "cliproxy-diagnostics-plugin/"+pluginVersion)
 
-	var resp *http.Response
 	var errDo error
-	started := time.Now()
 	for attempt := 0; attempt < 2; attempt++ {
 		if attempt > 0 {
 			req = req.Clone(context.Background())
-			started = time.Now()
 		}
-		resp, errDo = httpClient.Do(req)
-		latencyMS = time.Since(started).Milliseconds()
+		body, status, _, latencyMS, errDo = doHTTPRequest(mode, req, 64*1024)
 		if errDo == nil || !retryablePublicIPError(errDo) {
 			break
 		}
@@ -781,12 +941,7 @@ func httpGetJSON(url string) (body []byte, status int, latencyMS int64, err erro
 	if errDo != nil {
 		return nil, 0, latencyMS, errDo
 	}
-	defer closeBody(resp.Body)
-	data, errRead := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-	if errRead != nil {
-		return nil, resp.StatusCode, latencyMS, errRead
-	}
-	return data, resp.StatusCode, latencyMS, nil
+	return body, status, latencyMS, nil
 }
 
 func boolField(payload map[string]any, key string) bool {
