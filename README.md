@@ -130,6 +130,27 @@ curl -H "Authorization: Bearer <management-key>" \
   http://127.0.0.1:8317/v0/management/diagnostics/status
 ```
 
+## 第三方插件商店安装
+
+在 CPA 管理页面的插件商店中添加第三方插件源：
+
+```text
+https://raw.githubusercontent.com/yuankc/cpa-network-diagnostics-plugin/main/registry.json
+```
+
+也可以在 CPA `config.yaml` 中配置：
+
+```yaml
+plugins:
+  enabled: true
+  store-sources:
+    - "https://raw.githubusercontent.com/yuankc/cpa-network-diagnostics-plugin/main/registry.json"
+```
+
+添加插件源后，在插件商店中找到 `Network Diagnostics` 并安装即可。
+
+如果刚从手动安装失败，建议重启 CPA 服务一次，让插件目录扫描、配置和资源路由重新加载干净。
+
 ## Docker 测试
 
 Docker 容器里通常是 Linux，所以要放 Linux `.so`，不能把 Windows `.dll` 塞进去。
@@ -168,7 +189,7 @@ plugins:
 重启容器后访问：
 
 ```text
-http://<服务器IP>:8317/v0/resource/plugins/diagnostics/dashboard
+http://<服务器IP>:8317/v0/resource/plugins/cpa-network-diagnostics-plugin/dashboard
 ```
 
 ## 发布打包
