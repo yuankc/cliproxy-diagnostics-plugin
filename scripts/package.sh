@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version="${VERSION:-0.1.0}"
+version="${VERSION:-0.1.7}"
 goos="${GOOS:-$(go env GOOS)}"
 goarch="${GOARCH:-$(go env GOARCH)}"
 ext=".so"

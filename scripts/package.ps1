@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$version = if ($env:VERSION) { $env:VERSION } else { "0.1.0" }
+$version = if ($env:VERSION) { $env:VERSION } else { "0.1.7" }
 $goos = if ($env:GOOS) { $env:GOOS } else { (go env GOOS) }
 $goarch = if ($env:GOARCH) { $env:GOARCH } else { (go env GOARCH) }
 $ext = if ($goos -eq "windows") { ".dll" } elseif ($goos -eq "darwin") { ".dylib" } else { ".so" }

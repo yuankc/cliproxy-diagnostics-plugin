@@ -59,7 +59,7 @@ import (
 
 const (
 	pluginName    = "网络检测"
-	pluginVersion = "0.1.6"
+	pluginVersion = "0.1.7"
 	pluginAuthor  = "yuankc"
 	pluginRepo    = "https://github.com/yuankc/cpa-network-diagnostics-plugin"
 )
