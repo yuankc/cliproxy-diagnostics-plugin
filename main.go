@@ -61,7 +61,7 @@ const (
 	pluginName    = "网络检测"
 	pluginVersion = "0.1.6"
 	pluginAuthor  = "yuankc"
-	pluginRepo    = "https://github.com/yuankc/cliproxy-diagnostics-plugin"
+	pluginRepo    = "https://github.com/yuankc/cpa-network-diagnostics-plugin"
 )
 
 var (

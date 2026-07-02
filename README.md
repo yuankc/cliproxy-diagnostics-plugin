@@ -92,7 +92,7 @@ dist/<goos>/<goarch>/diagnostics.dylib
 Windows 本地示例：
 
 ```powershell
-cd cliproxy-diagnostics-plugin
+cd cpa-network-diagnostics-plugin
 .\scripts\build.ps1
 
 # 将diagnostics.dll拷贝至\CLIProxyAPI\plugins\windows\amd64

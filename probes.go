@@ -400,7 +400,7 @@ func fetchPublicIPFor(mode probeMode, name, url string) publicIPEndpoint {
 		return check
 	}
 	req.Header.Set("accept", "application/json,text/plain;q=0.8")
-	req.Header.Set("user-agent", "cliproxy-diagnostics-plugin/"+pluginVersion)
+	req.Header.Set("user-agent", "cpa-network-diagnostics-plugin/"+pluginVersion)
 
 	var errDo error
 	var body []byte
@@ -578,7 +578,7 @@ func probeHTTPFor(mode probeMode, name, url, note string) connectivityTest {
 		item.Error = compactError(errReq)
 		return item
 	}
-	req.Header.Set("user-agent", "cliproxy-diagnostics-plugin/"+pluginVersion)
+	req.Header.Set("user-agent", "cpa-network-diagnostics-plugin/"+pluginVersion)
 	body, status, _, latency, errDo := doHTTPRequest(mode, req, 16*1024)
 	item.LatencyMS = latency
 	if errDo != nil {
@@ -866,7 +866,7 @@ func fetchCFTraceFor(mode probeMode, url string) (string, error) {
 	if errReq != nil {
 		return "", errReq
 	}
-	req.Header.Set("user-agent", "cliproxy-diagnostics-plugin/"+pluginVersion)
+	req.Header.Set("user-agent", "cpa-network-diagnostics-plugin/"+pluginVersion)
 	body, status, _, _, errDo := doHTTPRequest(mode, req, 4096)
 	if errDo != nil {
 		return "", errDo
@@ -926,7 +926,7 @@ func httpGetJSONFor(mode probeMode, url string) (body []byte, status int, latenc
 		return nil, 0, 0, errReq
 	}
 	req.Header.Set("accept", "application/json,text/plain;q=0.8")
-	req.Header.Set("user-agent", "cliproxy-diagnostics-plugin/"+pluginVersion)
+	req.Header.Set("user-agent", "cpa-network-diagnostics-plugin/"+pluginVersion)
 
 	var errDo error
 	for attempt := 0; attempt < 2; attempt++ {

@@ -1,4 +1,4 @@
-module github.com/yuankc/cliproxy-diagnostics-plugin
+module github.com/yuankc/cpa-network-diagnostics-plugin
 
 go 1.26.0
 
