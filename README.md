@@ -210,8 +210,8 @@ bash scripts/package.sh
 输出示例：
 
 ```text
-release/cpa-network-diagnostics-plugin_0.1.9_windows_amd64.zip
-release/cpa-network-diagnostics-plugin_0.1.9_linux_amd64.zip
+release/cpa-network-diagnostics-plugin_0.1.10_windows_amd64.zip
+release/cpa-network-diagnostics-plugin_0.1.10_linux_amd64.zip
 ```
 
 本插件的商店发布格式遵循 CPA 官方插件商店规范：
@@ -240,8 +240,8 @@ cpa-network-diagnostics-plugin.dylib
 仓库已包含 GitHub Actions release workflow。推送 tag 后会构建多平台 zip、`.sha256` 和 `checksums.txt`：
 
 ```bash
-git tag v0.1.9
-git push origin v0.1.9
+git tag v0.1.10
+git push origin v0.1.10
 ```
 
 ## 插件规范

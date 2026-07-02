@@ -49,37 +49,16 @@ var state = {};
 var fullStatusPromise = null;
 var selectedNetwork = 'direct';
 
-refreshBtn.addEventListener('click', function(){ runDiagnostics(); });
+refreshBtn.addEventListener('click', function(){ runDiagnosticsProgressive(); });
 modeDirect.addEventListener('click', function(){ setNetworkMode('direct'); });
 modeHost.addEventListener('click', function(){ setNetworkMode('host'); });
-runDiagnostics();
-
-async function runDiagnostics(){
-  loading.classList.remove('hidden');
-  errorBox.classList.add('hidden');
-  content.classList.add('hidden');
-  refreshBtn.disabled = true;
-  try {
-    const resp = await fetch(sectionUrl(''), {cache:'no-store'});
-    if (!resp.ok) throw new Error('HTTP ' + resp.status);
-    const data = await resp.json();
-    content.innerHTML = render(data);
-    content.classList.remove('hidden');
-    renderBrowserInfo();
-  } catch (err) {
-    errorBox.textContent = '检测加载失败：' + (err && err.message ? err.message : String(err));
-    errorBox.classList.remove('hidden');
-  } finally {
-    loading.classList.add('hidden');
-    refreshBtn.disabled = false;
-  }
-}
+runDiagnosticsProgressive();
 
 function setNetworkMode(mode){
   selectedNetwork = mode === 'host' ? 'host' : 'direct';
   modeDirect.classList.toggle('active', selectedNetwork === 'direct');
   modeHost.classList.toggle('active', selectedNetwork === 'host');
-  runDiagnostics();
+  runDiagnosticsProgressive();
 }
 
 function sectionUrl(section){
@@ -184,10 +163,10 @@ function renderEgress(egress){
   const host = (egress && egress.host) || {};
   const signals = (egress && egress.signals) || [];
   const rowsHtml = rows([
-    row('当前摘要路径', egress.active_path || 'direct', egress.host_http_available ? 'host 可用' : 'host 不可用', egress.host_http_available ? '<span class="status ok">可用</span>' : '<span class="status warn">不可用</span>'),
-    row('Direct 出口', direct.ip || '未获取', compact([direct.country, direct.org], ' / ') || '-', direct.ip ? '<span class="status ok">完成</span>' : '<span class="status bad">失败</span>'),
-    row('Host 出口', host.ip || '未获取', compact([host.country, host.org], ' / ') || '-', host.ip ? '<span class="status ok">完成</span>' : '<span class="status bad">失败</span>'),
-    row('出口一致性', egress.compared ? (egress.same_ip ? '相同' : '不同') : '未比较', egress.compared ? 'direct vs host' : '至少一侧未获取到 IP', egress.compared ? (egress.same_ip ? '<span class="status warn">相同</span>' : '<span class="status ok">不同</span>') : '<span class="status warn">未知</span>')
+    row('当前摘要路径', egress.active_path || 'direct', egress.host_http_available ? '<span class="status ok">host 可用</span>' : '<span class="status warn">host 不可用</span>'),
+    row('Direct 出口', direct.ip || '未获取', direct.ip ? '<span class="status ok">' + esc(compact([direct.country, direct.org], ' / ') || '完成') + '</span>' : '<span class="status bad">失败</span>'),
+    row('Host 出口', host.ip || '未获取', host.ip ? '<span class="status ok">' + esc(compact([host.country, host.org], ' / ') || '完成') + '</span>' : '<span class="status bad">失败</span>'),
+    row('出口一致性', egress.compared ? (egress.same_ip ? '相同' : '不同') : '未比较', egress.compared ? (egress.same_ip ? '<span class="status warn">direct vs host 相同</span>' : '<span class="status ok">direct vs host 不同</span>') : '<span class="status warn">至少一侧未获取到 IP</span>')
   ]);
   return rowsHtml + '<div class="small">' + esc(egress.note || 'direct 为插件直连，host 为 CPA 宿主 HTTP 回调。') + '</div>' +
     (signals.length ? '<div class="rows" style="margin-top:8px">' + signals.map(function(s){ return row('信号', s, ''); }).join('') + '</div>' : '');
@@ -288,8 +267,7 @@ function esc(value){
   });
 }
 
-// Progressive dashboard override. Later function declarations intentionally replace the initial simple loader.
-async function runDiagnostics(){
+async function runDiagnosticsProgressive(){
   const runId = ++currentRun;
   const started = Date.now();
   state = {checked_at: new Date().toISOString()};
