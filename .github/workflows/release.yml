@@ -9,7 +9,7 @@ on:
       version:
         description: "Release version without leading v"
         required: false
-        default: "0.1.7"
+        default: "0.1.8"
 
 permissions:
   contents: write
@@ -54,7 +54,7 @@ jobs:
           elif [[ -n "${{ github.event.inputs.version }}" ]]; then
             echo "VERSION=${{ github.event.inputs.version }}" >> "$GITHUB_ENV"
           else
-            echo "VERSION=0.1.7" >> "$GITHUB_ENV"
+            echo "VERSION=0.1.8" >> "$GITHUB_ENV"
           fi
 
       - name: Set up MSYS2 for Windows CGO
@@ -107,7 +107,7 @@ jobs:
           elif [[ -n "${{ github.event.inputs.version }}" ]]; then
             echo "RELEASE_TAG=v${{ github.event.inputs.version }}" >> "$GITHUB_ENV"
           else
-            echo "RELEASE_TAG=v0.1.7" >> "$GITHUB_ENV"
+            echo "RELEASE_TAG=v0.1.8" >> "$GITHUB_ENV"
           fi
 
       - name: Download artifacts
