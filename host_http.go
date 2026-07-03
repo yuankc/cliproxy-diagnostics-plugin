@@ -12,6 +12,8 @@ import (
 
 var errHostUnavailable = errors.New("host HTTP callback is unavailable")
 
+var hostHTTPGate = make(chan struct{}, 4)
+
 type hostHTTPRequest struct {
 	Method  string      `json:"method,omitempty"`
 	URL     string      `json:"url,omitempty"`
@@ -33,8 +35,13 @@ func hostHTTPDo(ctx context.Context, req hostHTTPRequest) (hostHTTPResponse, err
 		default:
 		}
 	}
+	if err := acquireHostHTTPSlot(ctx); err != nil {
+		return hostHTTPResponse{}, err
+	}
+
 	rawReq, errMarshal := json.Marshal(req)
 	if errMarshal != nil {
+		releaseHostHTTPSlot()
 		return hostHTTPResponse{}, errMarshal
 	}
 	type result struct {
@@ -43,6 +50,7 @@ func hostHTTPDo(ctx context.Context, req hostHTTPRequest) (hostHTTPResponse, err
 	}
 	done := make(chan result, 1)
 	go func() {
+		defer releaseHostHTTPSlot()
 		rawResp, errCall := callHost(pluginabi.MethodHostHTTPDo, rawReq)
 		done <- result{raw: rawResp, err: errCall}
 	}()
@@ -60,6 +68,26 @@ func hostHTTPDo(ctx context.Context, req hostHTTPRequest) (hostHTTPResponse, err
 		return hostHTTPResponse{}, res.err
 	}
 	return decodeHostEnvelope[hostHTTPResponse](res.raw)
+}
+
+func acquireHostHTTPSlot(ctx context.Context) error {
+	if ctx == nil {
+		hostHTTPGate <- struct{}{}
+		return nil
+	}
+	select {
+	case hostHTTPGate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func releaseHostHTTPSlot() {
+	select {
+	case <-hostHTTPGate:
+	default:
+	}
 }
 
 func decodeHostEnvelope[T any](raw []byte) (T, error) {

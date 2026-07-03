@@ -64,7 +64,12 @@ http://<服务器IP>:8317/v0/resource/plugins/cpa-network-diagnostics-plugin/das
 curl "http://<服务器IP>:8317/v0/resource/plugins/cpa-network-diagnostics-plugin/status?network=host"
 ```
 
-兼容的 Management API 仍保留在 `/v0/management/diagnostics/status`。
+资源接口用于页面渐进加载，返回公开脱敏视图：会隐藏 hostname、PID、本机网卡 IP、出站本地源地址、代理变量值、Cloudflare 返回的出口 IP 和 compliance 原始响应体。需要完整诊断明细时使用兼容保留的 Management API：
+
+```bash
+curl -H "Authorization: Bearer <management-key>" \
+  "http://<服务器IP>:8317/v0/management/diagnostics/status?network=host"
+```
 
 ## 本地手动安装
 
@@ -210,8 +215,8 @@ bash scripts/package.sh
 输出示例：
 
 ```text
-release/cpa-network-diagnostics-plugin_0.1.12_windows_amd64.zip
-release/cpa-network-diagnostics-plugin_0.1.12_linux_amd64.zip
+release/cpa-network-diagnostics-plugin_0.1.13_windows_amd64.zip
+release/cpa-network-diagnostics-plugin_0.1.13_linux_amd64.zip
 ```
 
 本插件的商店发布格式遵循 CPA 官方插件商店规范：
@@ -240,8 +245,8 @@ cpa-network-diagnostics-plugin.dylib
 仓库已包含 GitHub Actions release workflow。推送 tag 后会构建多平台 zip、`.sha256` 和 `checksums.txt`：
 
 ```bash
-git tag v0.1.12
-git push origin v0.1.12
+git tag v0.1.13
+git push origin v0.1.13
 ```
 
 ## 插件规范

@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
-	"os"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -15,15 +13,15 @@ import (
 )
 
 var (
-	diagnosticsCacheMu      sync.Mutex
-	diagnosticsCacheData    = make(map[probeMode]diagnosticsCacheEntry)
-	diagnosticsCacheLoading bool
-	diagnosticsCacheCond    = sync.NewCond(&diagnosticsCacheMu)
+	diagnosticsCacheMu   sync.Mutex
+	diagnosticsCacheData = make(map[probeMode]*diagnosticsCacheEntry)
 )
 
 type diagnosticsCacheEntry struct {
 	data    diagnostics
 	expires time.Time
+	loading bool
+	cond    *sync.Cond
 }
 
 func handleMethod(method string, payload []byte) ([]byte, error) {
@@ -34,6 +32,16 @@ func handleMethod(method string, payload []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.ManagementRegistrationResponse{
 			Routes: []pluginapi.ManagementRoute{
 				{Method: http.MethodGet, Path: "/diagnostics/status", Description: "Returns CPA process network check results as JSON."},
+				{Method: http.MethodGet, Path: "/diagnostics/status/runtime", Description: "Returns runtime, local IP, and proxy check results."},
+				{Method: http.MethodGet, Path: "/diagnostics/status/proxy", Description: "Returns proxy environment check results."},
+				{Method: http.MethodGet, Path: "/diagnostics/status/egress", Description: "Returns direct vs host egress check results."},
+				{Method: http.MethodGet, Path: "/diagnostics/status/public-ip", Description: "Returns public IP check results."},
+				{Method: http.MethodGet, Path: "/diagnostics/status/ip-risk", Description: "Returns IP reputation check results."},
+				{Method: http.MethodGet, Path: "/diagnostics/status/openai", Description: "Returns OpenAI availability check results."},
+				{Method: http.MethodGet, Path: "/diagnostics/status/geo", Description: "Returns geographic consistency check results."},
+				{Method: http.MethodGet, Path: "/diagnostics/status/dns", Description: "Returns DNS check results."},
+				{Method: http.MethodGet, Path: "/diagnostics/status/connectivity", Description: "Returns HTTP connectivity check results."},
+				{Method: http.MethodGet, Path: "/diagnostics/status/outbound", Description: "Returns outbound source address check results."},
 			},
 			Resources: []pluginapi.ResourceRoute{
 				{Path: "/dashboard", Menu: "网络检测", Description: "显示公网 IP、本地 IP、DNS 和 OpenAI 连接情况。"},
@@ -78,7 +86,7 @@ func registrationPayload() registration {
 
 func handleManagement(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	if kind := statusPathKind(req.Path); kind != "" {
-		return diagnosticsJSONResponse(kind, probeModeFromRequest(req))
+		return diagnosticsJSONResponse(kind, probeModeFromRequest(req), isResourceRequest(req.Path))
 	}
 	return pluginapi.ManagementResponse{
 		StatusCode: http.StatusOK,
@@ -90,8 +98,12 @@ func handleManagement(req pluginapi.ManagementRequest) pluginapi.ManagementRespo
 	}
 }
 
-func diagnosticsJSONResponse(kind string, mode probeMode) pluginapi.ManagementResponse {
-	body, errMarshal := json.MarshalIndent(diagnosticsPayload(kind, mode), "", "  ")
+func diagnosticsJSONResponse(kind string, mode probeMode, public bool) pluginapi.ManagementResponse {
+	payload := diagnosticsPayload(kind, mode)
+	if public {
+		payload = redactDiagnosticsPayload(kind, payload)
+	}
+	body, errMarshal := json.MarshalIndent(payload, "", "  ")
 	if errMarshal != nil {
 		return textResponse(http.StatusInternalServerError, errMarshal.Error())
 	}
@@ -103,6 +115,14 @@ func diagnosticsJSONResponse(kind string, mode probeMode) pluginapi.ManagementRe
 		},
 		Body: body,
 	}
+}
+
+func isResourceRequest(path string) bool {
+	if index := strings.Index(path, "?"); index >= 0 {
+		path = path[:index]
+	}
+	cleaned := "/" + strings.Trim(strings.TrimSuffix(path, "/"), "/")
+	return strings.HasPrefix(cleaned, "/v0/resource/plugins/") || strings.HasPrefix(cleaned, "/plugins/")
 }
 
 func isStatusPath(path string) bool {
@@ -160,49 +180,34 @@ func probeModeFromRequest(req pluginapi.ManagementRequest) probeMode {
 }
 
 func diagnosticsPayload(kind string, mode probeMode) any {
+	data := cachedDiagnostics(mode)
 	switch kind {
 	case "runtime":
-		hostname, _ := os.Hostname()
-		tzName, tzUTC := localTimezone()
-		proxy := collectProxyInfo()
 		return map[string]any{
-			"runtime":   runtimeInfo{Hostname: hostname, GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, PID: os.Getpid(), TimezoneName: tzName, TimezoneUTC: tzUTC},
-			"local_ips": collectLocalIPs(),
-			"proxy":     proxy,
+			"runtime":   data.Runtime,
+			"local_ips": data.LocalIPs,
+			"proxy":     data.Proxy,
 		}
 	case "proxy":
-		return collectProxyInfo()
+		return data.Proxy
 	case "egress":
-		directPublicIP := detectPublicIPFor(probeModeDirect)
-		hostPublicIP := publicIPResult{}
-		if hostHTTPAvailable() {
-			hostPublicIP = detectPublicIPFor(probeModeHost)
-		}
-		return compareEgress(directPublicIP, hostPublicIP, mode)
+		return data.Egress
 	case "public-ip":
-		return detectPublicIPFor(mode)
+		return data.PublicIP
 	case "ip-risk":
-		publicIP := detectPublicIPFor(mode)
-		payload := map[string]any{"public_ip": publicIP, "ip_risk": ipRiskProfile{}}
-		if publicIP.IP != "" {
-			payload["ip_risk"] = detectIPRiskFor(mode, publicIP.IP)
-		}
-		return payload
+		return map[string]any{"public_ip": data.PublicIP, "ip_risk": data.IPRisk}
 	case "openai":
-		return detectOpenAIAvailabilityFor(mode)
+		return data.OpenAI
 	case "geo":
-		tzName, tzUTC := localTimezone()
-		publicIP := detectPublicIPFor(mode)
-		openAI := detectOpenAIAvailabilityFor(mode)
-		return evaluateGeoConsistency(publicIP, openAI, tzName, tzUTC)
+		return data.Geo
 	case "dns":
-		return checkDNS([]string{"chatgpt.com", "api.openai.com", "auth.openai.com", "cdn.openai.com"})
+		return data.DNS
 	case "connectivity":
-		return checkConnectivityFor(mode)
+		return data.Connectivity
 	case "outbound":
-		return detectOutboundSources([]string{"api.openai.com:443", "chatgpt.com:443", "1.1.1.1:443"})
+		return data.OutboundSources
 	default:
-		return cachedDiagnostics(mode)
+		return data
 	}
 }
 
@@ -210,25 +215,161 @@ func cachedDiagnostics(mode probeMode) diagnostics {
 	now := time.Now()
 	diagnosticsCacheMu.Lock()
 	for {
-		if cache, ok := diagnosticsCacheData[mode]; ok && !cache.expires.IsZero() && now.Before(cache.expires) {
+		cache := diagnosticsCacheData[mode]
+		if cache == nil {
+			cache = &diagnosticsCacheEntry{}
+			cache.cond = sync.NewCond(&diagnosticsCacheMu)
+			diagnosticsCacheData[mode] = cache
+		}
+		if !cache.expires.IsZero() && now.Before(cache.expires) {
 			cached := cache.data
 			diagnosticsCacheMu.Unlock()
 			return cached
 		}
-		if !diagnosticsCacheLoading {
-			diagnosticsCacheLoading = true
+		if !cache.loading {
+			cache.loading = true
 			diagnosticsCacheMu.Unlock()
 
 			data := collectDiagnosticsFor(mode)
 
 			diagnosticsCacheMu.Lock()
-			diagnosticsCacheData[mode] = diagnosticsCacheEntry{data: data, expires: time.Now().Add(30 * time.Second)}
-			diagnosticsCacheLoading = false
-			diagnosticsCacheCond.Broadcast()
+			cache.data = data
+			cache.expires = time.Now().Add(30 * time.Second)
+			cache.loading = false
+			cache.cond.Broadcast()
 			diagnosticsCacheMu.Unlock()
 			return data
 		}
-		diagnosticsCacheCond.Wait()
+		cache.cond.Wait()
 		now = time.Now()
 	}
+}
+
+func redactDiagnosticsPayload(kind string, payload any) any {
+	switch value := payload.(type) {
+	case diagnostics:
+		return redactDiagnostics(value)
+	case map[string]any:
+		out := make(map[string]any, len(value))
+		for key, item := range value {
+			switch key {
+			case "runtime":
+				if runtimeValue, ok := item.(runtimeInfo); ok {
+					out[key] = redactRuntimeInfo(runtimeValue)
+				} else {
+					out[key] = item
+				}
+			case "local_ips":
+				out[key] = []localIP{}
+			case "proxy":
+				if proxyValue, ok := item.(proxyInfo); ok {
+					out[key] = redactProxyInfo(proxyValue)
+				} else {
+					out[key] = item
+				}
+			case "public_ip":
+				if publicIP, ok := item.(publicIPResult); ok {
+					out[key] = redactPublicIPResult(publicIP)
+				} else {
+					out[key] = item
+				}
+			case "ip_risk":
+				if risk, ok := item.(ipRiskProfile); ok {
+					out[key] = redactIPRiskProfile(risk)
+				} else {
+					out[key] = item
+				}
+			default:
+				out[key] = item
+			}
+		}
+		return out
+	case runtimeInfo:
+		return redactRuntimeInfo(value)
+	case proxyInfo:
+		return redactProxyInfo(value)
+	case egressComparison:
+		return redactEgressComparison(value)
+	case publicIPResult:
+		return redactPublicIPResult(value)
+	case ipRiskProfile:
+		return redactIPRiskProfile(value)
+	case openAIAvailability:
+		return redactOpenAIAvailability(value)
+	case geoConsistency:
+		return redactGeoConsistency(value)
+	case []outboundSource:
+		return redactOutboundSources(value)
+	default:
+		_ = kind
+		return payload
+	}
+}
+
+func redactDiagnostics(data diagnostics) diagnostics {
+	data.Runtime = redactRuntimeInfo(data.Runtime)
+	data.Proxy = redactProxyInfo(data.Proxy)
+	data.Egress = redactEgressComparison(data.Egress)
+	data.LocalIPs = nil
+	data.OutboundSources = redactOutboundSources(data.OutboundSources)
+	data.PublicIP = redactPublicIPResult(data.PublicIP)
+	data.IPRisk = redactIPRiskProfile(data.IPRisk)
+	data.OpenAI = redactOpenAIAvailability(data.OpenAI)
+	data.Geo = redactGeoConsistency(data.Geo)
+	return data
+}
+
+func redactRuntimeInfo(info runtimeInfo) runtimeInfo {
+	info.Hostname = ""
+	info.PID = 0
+	return info
+}
+
+func redactProxyInfo(info proxyInfo) proxyInfo {
+	for index := range info.Variables {
+		info.Variables[index].Value = ""
+	}
+	if info.Detected {
+		info.Note = "检测到代理环境变量；公开资源接口已隐藏具体变量值。"
+	}
+	return info
+}
+
+func redactEgressComparison(egress egressComparison) egressComparison {
+	egress.Direct = redactPublicIPResult(egress.Direct)
+	egress.Host = redactPublicIPResult(egress.Host)
+	return egress
+}
+
+func redactPublicIPResult(result publicIPResult) publicIPResult {
+	for index := range result.Checks {
+		result.Checks[index].Error = ""
+	}
+	return result
+}
+
+func redactIPRiskProfile(profile ipRiskProfile) ipRiskProfile {
+	for index := range profile.Checks {
+		profile.Checks[index].Error = ""
+	}
+	return profile
+}
+
+func redactOpenAIAvailability(openAI openAIAvailability) openAIAvailability {
+	openAI.CFIP = ""
+	openAI.ComplianceBody = ""
+	return openAI
+}
+
+func redactGeoConsistency(geo geoConsistency) geoConsistency {
+	return geo
+}
+
+func redactOutboundSources(items []outboundSource) []outboundSource {
+	out := make([]outboundSource, len(items))
+	for index, item := range items {
+		item.LocalIP = ""
+		out[index] = item
+	}
+	return out
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version="${VERSION:-0.1.12}"
+version="${VERSION:-0.1.13}"
 goos="${GOOS:-$(go env GOOS)}"
 goarch="${GOARCH:-$(go env GOARCH)}"
 plugin_id="cpa-network-diagnostics-plugin"

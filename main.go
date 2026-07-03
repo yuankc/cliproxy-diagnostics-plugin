@@ -59,7 +59,6 @@ import (
 
 const (
 	pluginName    = "网络检测"
-	pluginVersion = "0.1.12"
 	pluginAuthor  = "yuankc"
 	pluginRepo    = "https://github.com/yuankc/cpa-network-diagnostics-plugin"
 	pluginStoreID = "cpa-network-diagnostics-plugin"
@@ -69,6 +68,8 @@ var (
 	hostAPIMu sync.RWMutex
 	hostAPI   *C.cliproxy_host_api
 )
+
+var pluginVersion = "0.1.13"
 
 func main() {}
 

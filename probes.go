@@ -829,22 +829,7 @@ func detectOpenAIAvailabilityFor(mode probeMode) openAIAvailability {
 	if complianceErr != nil {
 		result.Error = publicIPErrorMessage(complianceErr)
 	} else {
-		sample := strings.ToLower(string(complianceBody))
-		result.ComplianceBody = strings.TrimSpace(truncate(string(complianceBody), 300))
-		if complianceStatus >= 200 && complianceStatus < 300 {
-			result.ComplianceOK = true
-			result.Determined = true
-			if strings.Contains(sample, "unsupported_country") {
-				result.UnsupportedCountry = true
-				result.Supported = false
-				result.Note = "OpenAI compliance 接口返回 unsupported_country，当前出口 IP 所在国家/地区不被支持。"
-			} else {
-				result.Supported = true
-				result.Note = "OpenAI compliance 接口成功返回且未出现 unsupported_country，当前出口 IP 所在地区大概率可用。"
-			}
-		} else {
-			result.Error = fmt.Sprintf("OpenAI compliance HTTP %d", complianceStatus)
-		}
+		applyComplianceResult(&result, complianceStatus, complianceBody)
 	}
 	if result.Note == "" {
 		if result.CFCountry != "" {
@@ -855,6 +840,34 @@ func detectOpenAIAvailabilityFor(mode probeMode) openAIAvailability {
 		}
 	}
 	return result
+}
+
+func applyComplianceResult(result *openAIAvailability, status int, body []byte) {
+	if result == nil {
+		return
+	}
+	sample := strings.ToLower(string(body))
+	result.ComplianceBody = strings.TrimSpace(truncate(string(body), 300))
+	if strings.Contains(sample, "unsupported_country") {
+		result.UnsupportedCountry = true
+		result.Supported = false
+		result.Determined = true
+		result.Note = "OpenAI compliance 接口返回 unsupported_country，当前出口 IP 所在国家/地区不被支持。"
+		if status >= 200 && status < 300 {
+			result.ComplianceOK = true
+		} else {
+			result.Error = fmt.Sprintf("OpenAI compliance HTTP %d", status)
+		}
+		return
+	}
+	if status >= 200 && status < 300 {
+		result.ComplianceOK = true
+		result.Determined = true
+		result.Supported = true
+		result.Note = "OpenAI compliance 接口成功返回且未出现 unsupported_country，当前出口 IP 所在地区大概率可用。"
+		return
+	}
+	result.Error = fmt.Sprintf("OpenAI compliance HTTP %d", status)
 }
 
 func fetchCFTrace(url string) (string, error) {

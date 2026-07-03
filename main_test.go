@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
@@ -8,6 +9,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -70,6 +72,73 @@ func TestStatusPathKindSections(t *testing.T) {
 	}
 }
 
+func TestManagementRegisterIncludesStatusSectionRoutes(t *testing.T) {
+	raw, err := handleMethod(pluginabi.MethodManagementRegister, nil)
+	if err != nil {
+		t.Fatalf("handleMethod(management.register) error = %v", err)
+	}
+	var envelope pluginabi.Envelope
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	if !envelope.OK {
+		t.Fatalf("management register envelope not ok: %#v", envelope.Error)
+	}
+	var resp pluginapi.ManagementRegistrationResponse
+	if err := json.Unmarshal(envelope.Result, &resp); err != nil {
+		t.Fatalf("decode management response: %v", err)
+	}
+	managementPaths := map[string]bool{}
+	for _, route := range resp.Routes {
+		managementPaths[route.Path] = true
+	}
+	for _, path := range []string{"/diagnostics/status", "/diagnostics/status/openai", "/diagnostics/status/ip-risk", "/diagnostics/status/outbound"} {
+		if !managementPaths[path] {
+			t.Fatalf("management route %q missing from %#v", path, managementPaths)
+		}
+	}
+	resourcePaths := map[string]bool{}
+	for _, route := range resp.Resources {
+		resourcePaths[route.Path] = true
+	}
+	for _, path := range []string{"/dashboard", "/status", "/status/openai", "/status/ip-risk", "/status/outbound"} {
+		if !resourcePaths[path] {
+			t.Fatalf("resource route %q missing from %#v", path, resourcePaths)
+		}
+	}
+}
+
+func TestRedactDiagnosticsHidesPrivateRuntimeAndNetworkDetails(t *testing.T) {
+	data := diagnostics{
+		Runtime:         runtimeInfo{Hostname: "host-a", GOOS: "linux", GOARCH: "amd64", PID: 42, TimezoneUTC: "UTC+08:00"},
+		Proxy:           proxyInfo{Detected: true, Variables: []proxyVariable{{Name: "HTTPS_PROXY", Value: "http://user:pass@example.com", Set: true}}},
+		LocalIPs:        []localIP{{Interface: "eth0", Address: "192.168.1.10", Version: "IPv4", Private: true}},
+		OutboundSources: []outboundSource{{Target: "api.openai.com:443", LocalIP: "192.168.1.10", OK: true}},
+		PublicIP:        publicIPResult{IP: "203.0.113.10", Checks: []publicIPEndpoint{{Name: "ipinfo", Error: "request failed"}}},
+		IPRisk:          ipRiskProfile{Checks: []ipRiskCheck{{Name: "ipapi.is", Error: "rate limited"}}},
+		OpenAI:          openAIAvailability{CFIP: "203.0.113.10", ComplianceBody: `{"ok":true}`, Determined: true},
+	}
+	redacted := redactDiagnostics(data)
+	if redacted.Runtime.Hostname != "" || redacted.Runtime.PID != 0 {
+		t.Fatalf("runtime was not redacted: %#v", redacted.Runtime)
+	}
+	if len(redacted.LocalIPs) != 0 {
+		t.Fatalf("local IPs were not redacted: %#v", redacted.LocalIPs)
+	}
+	if redacted.Proxy.Variables[0].Value != "" {
+		t.Fatalf("proxy value was not redacted: %#v", redacted.Proxy.Variables[0])
+	}
+	if redacted.OutboundSources[0].LocalIP != "" {
+		t.Fatalf("outbound local IP was not redacted: %#v", redacted.OutboundSources[0])
+	}
+	if redacted.PublicIP.Checks[0].Error != "" || redacted.IPRisk.Checks[0].Error != "" {
+		t.Fatalf("provider errors were not redacted: public=%#v risk=%#v", redacted.PublicIP.Checks[0], redacted.IPRisk.Checks[0])
+	}
+	if redacted.OpenAI.CFIP != "" || redacted.OpenAI.ComplianceBody != "" {
+		t.Fatalf("openai details were not redacted: %#v", redacted.OpenAI)
+	}
+}
+
 func TestSanitizeProxyValue(t *testing.T) {
 	got := sanitizeProxyValue("http://user:secret@example.com:8080")
 	if strings.Contains(got, "user") || strings.Contains(got, "secret") || !strings.Contains(got, "example.com:8080") {
@@ -123,6 +192,17 @@ func TestIPRiskHTTPError(t *testing.T) {
 	}
 	if got := ipRiskHTTPError("ipapi.is", http.StatusInternalServerError); got != "HTTP 500" {
 		t.Fatalf("unexpected generic HTTP error: %q", got)
+	}
+}
+
+func TestApplyComplianceResultDetectsUnsupportedCountryOnNon2xx(t *testing.T) {
+	var result openAIAvailability
+	applyComplianceResult(&result, http.StatusForbidden, []byte(`{"error":"unsupported_country"}`))
+	if !result.Determined || !result.UnsupportedCountry || result.Supported || result.ComplianceOK {
+		t.Fatalf("unexpected compliance result: %#v", result)
+	}
+	if !strings.Contains(result.Error, "403") {
+		t.Fatalf("expected HTTP status error, got %q", result.Error)
 	}
 }
 
